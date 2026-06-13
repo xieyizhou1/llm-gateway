@@ -1,0 +1,127 @@
+server:
+  host: 127.0.0.1
+  port: 18080
+auth:
+  disabled: false
+  virtual_keys:
+  - key: sk-your-virtual-key-here
+    user: default
+    allowed_models:
+    - kimi-for-coding
+    - claude-sonnet-4-6
+    - gpt-5.5
+    rpm_limit: 100
+    tpm_limit: 200000
+    concurrency_limit: 10
+    daily_spend_limit_cents: 0
+providers:
+  kimi:
+    base_url: https://api.kimi.com/coding/v1
+    headers:
+      User-Agent: claude-code/1.0
+    keys:
+    - id: kimi-1
+      key: sk-your-kimi-key-1
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
+    - id: kimi-2
+      key: sk-your-kimi-key-2
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
+    - id: kimi-3
+      key: sk-your-kimi-key-3
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
+    - id: kimi-4
+      key: sk-your-kimi-key-4
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
+    - id: kimi-5
+      key: sk-your-kimi-key-5
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
+    - id: kimi-6
+      key: sk-your-kimi-key-6
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
+    model_map:
+      kimi-for-coding: kimi-for-coding
+      claude-sonnet-4-6: kimi-for-coding
+      gpt-5.5: kimi-for-coding
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    keys:
+    - id: deepseek-1
+      key: sk-your-deepseek-key-1
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 10
+    model_map: {}
+model_capabilities:
+  kimi-for-coding:
+    upstream_model: kimi-for-coding
+    max_context_tokens: 262144
+    max_output_tokens: 32768
+    supports_tools: true
+    supports_streaming: true
+    supports_thinking: true
+    supports_prompt_cache: true
+    supports_images: true
+    notes: Kimi for Coding capability profile. Client-facing aliases are compatibility
+      names, not 1M Claude/OpenAI models.
+  claude-sonnet-4-6:
+    upstream_model: kimi-for-coding
+    max_context_tokens: 262144
+    max_output_tokens: 32768
+    supports_tools: true
+    supports_streaming: true
+    supports_thinking: true
+    supports_prompt_cache: true
+    supports_images: true
+    notes: Kimi for Coding capability profile. Client-facing aliases are compatibility
+      names, not 1M Claude/OpenAI models.
+  gpt-5.5:
+    upstream_model: kimi-for-coding
+    max_context_tokens: 262144
+    max_output_tokens: 32768
+    supports_tools: true
+    supports_streaming: true
+    supports_thinking: true
+    supports_prompt_cache: true
+    supports_images: true
+    notes: Kimi for Coding capability profile. Client-facing aliases are compatibility
+      names, not 1M Claude/OpenAI models.
+redis:
+  host: localhost
+  port: 6379
+  password: your-redis-password
+  db: 0
+router:
+  strategy: round_robin
+  provider_order:
+  - deepseek
+  - kimi
+  retry_count: 8
+  timeout_seconds: 120
+  cooldown_seconds: 60
+  failure_threshold: 3
+usage:
+  enabled: true
+  sqlite_path: /opt/llm-gateway/llm-gateway.db
+billing:
+  enabled: true
+  default_input_cents_per_1m: 0
+  default_output_cents_per_1m: 0
+  daily_spend_limit_cents: 0
+dashboard:
+  enabled: true
+  token: your-dashboard-token
+logging:
+  level: INFO
+  format: json
