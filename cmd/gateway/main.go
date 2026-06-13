@@ -1845,13 +1845,17 @@ html,body{height:100%;font-family:var(--font-sans);font-size:14px;line-height:1.
 .provider-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);cursor:pointer;transition:all .2s}
 .provider-card:hover{box-shadow:var(--shadow-lg);border-color:var(--text-3)}
 .provider-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-.provider-name{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+.provider-name{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.provider-name .status-dot{flex-shrink:0}
 .provider-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .provider-stat{text-align:center}
 .provider-stat-value{font-size:18px;font-weight:600}
 .provider-stat-label{font-size:11px;color:var(--text-3);margin-top:2px;text-transform:uppercase;letter-spacing:.03em}
 .provider-bar{height:4px;background:var(--surface-2);border-radius:999px;margin-top:16px;overflow:hidden}
 .provider-bar-fill{height:100%;border-radius:999px;transition:width .5s ease}
+.provider-table-row{display:grid;grid-template-columns:200px 80px 100px 100px 100px 80px;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border-2);font-size:13px}
+.provider-table-row:hover{background:var(--surface-2)}
+.provider-table-head{font-size:11px;font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.03em;padding:10px 16px;border-bottom:1px solid var(--border-2);display:grid;grid-template-columns:200px 80px 100px 100px 100px 80px;gap:12px}
 
 /* ─── Tables ─── */
 .table-wrap{overflow-x:auto}
@@ -1869,12 +1873,13 @@ tbody tr.active{background:var(--surface-3)}
 .badge-gray{background:var(--surface-3);color:var(--text-2)}
 
 /* ─── Charts ─── */
-.chart-container{height:200px;position:relative;margin-top:12px}
+.chart-container{height:180px;position:relative;margin-top:12px}
 .chart-bar{display:flex;align-items:flex-end;gap:3px;height:100%;padding:0 4px}
 .chart-bar-item{flex:1;background:var(--accent);border-radius:3px 3px 0 0;opacity:.7;transition:opacity .2s;min-width:4px}
 .chart-bar-item:hover{opacity:1}
 .chart-labels{display:flex;gap:3px;padding:0 4px;margin-top:6px}
 .chart-label{flex:1;text-align:center;font-size:10px;color:var(--text-3);min-width:4px;overflow:hidden;text-overflow:ellipsis}
+.chart-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-3);font-size:13px}
 
 /* ─── Drawers ─── */
 .drawer{position:fixed;inset:0 0 0 auto;width:min(520px,100vw);background:var(--surface);box-shadow:var(--shadow-lg);z-index:100;transform:translateX(100%);transition:transform .3s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column}
@@ -2189,7 +2194,7 @@ function healthCard(icon,status,title,desc,meta){const cls=status==='ok'?'ok':st
 function metricCard(label,value,hint,delta){return'<div class="metric-card"><div class="metric-label">'+label+'</div><div class="metric-value">'+value+'</div><div class="metric-hint">'+hint+(delta?'<span class="metric-delta '+delta.cls+'">'+delta.text+'</span>':'')+'</div></div>'}
 
 // ─── Overview ───
-function renderOverview(s,rows,keydata,errors){const avgCache=rows.length?rows.reduce((a,r)=>a+num(r.cache_hit_rate),0)/rows.length:0;const slow=rows.filter(r=>r.slow_reason||num(r.status_code)>=400).length;const errorRate=rows.length?Math.round(slow/rows.length*1000)/10:0;
+function renderOverview(s,rows,keydata,errors,usage){const avgCache=rows.length?rows.reduce((a,r)=>a+num(r.cache_hit_rate),0)/rows.length:0;const slow=rows.filter(r=>r.slow_reason||num(r.status_code)>=400).length;const errorRate=rows.length?Math.round(slow/rows.length*1000)/10:0;
 
 // Health Cards
 const providers=(keydata.keys||[]).map(k=>k.provider).filter((v,i,a)=>a.indexOf(v)===i);
@@ -2214,24 +2219,46 @@ el('overviewMetrics').innerHTML=
   metricCard('Cost',money(s.cost_cents),'total',{cls:'down',text:''})+
   metricCard('Slow/Error',compact(slow),'recent 100',{cls:slow>10?'up':'down',text:''});
 
-// Provider Cards
+// Provider Cards - use compact table when > 4 providers
 const stats={};(keydata.stats||[]).forEach(x=>stats[x.provider+'/'+x.provider_key_id]=x);
-el('providerCards').innerHTML=(keydata.keys||[]).map(k=>{
-  const st=stats[k.provider+'/'+k.id]||{};const rate=Math.round(num(st.success_rate)*1000)/10;
-  const cls=k.state==='healthy'?'ok':k.state==='cooldown'?'warn':'bad';
-  return'<div class="provider-card" data-provider="'+esc(k.provider)+'" data-key="'+esc(k.id)+'">'+
-    '<div class="provider-top"><div class="provider-name"><span class="status-dot status-'+cls+'"></span>'+esc(k.provider)+'/'+esc(k.id)+'</div>'+stateBadge(k.state)+'</div>'+
-    '<div class="provider-stats">'+
-      '<div class="provider-stat"><div class="provider-stat-value">'+rate+'%</div><div class="provider-stat-label">Success</div></div>'+
-      '<div class="provider-stat"><div class="provider-stat-value">'+compact(st.total_tokens||0)+'</div><div class="provider-stat-label">Tokens</div></div>'+
-      '<div class="provider-stat"><div class="provider-stat-value">'+v(st.requests)+'</div><div class="provider-stat-label">Requests</div></div>'+
-    '</div>'+
-    '<div class="provider-bar"><div class="provider-bar-fill" style="width:'+rate+'%;background:'+(rate>90?'var(--green)':rate>70?'var(--amber)':'var(--red)')+'"></div></div>'+
-  '</div>';
-}).join('')||'<div class="empty-state"><div class="empty-state-title">No providers</div></div>';
+const providerKeys = keydata.keys || [];
+if (providerKeys.length > 4) {
+  // Compact table view
+  el('providerCards').innerHTML = '<div class="card"><div class="card-head"><div class="card-title">Provider Keys</div></div><div class="card-body" style="padding:0">' +
+    '<div class="provider-table-head"><div>Provider/Key</div><div>State</div><div>Success</div><div>Tokens</div><div>Requests</div><div>Actions</div></div>' +
+    providerKeys.map(k => {
+      const st = stats[k.provider + '/' + k.id] || {};
+      const rate = Math.round(num(st.success_rate) * 1000) / 10;
+      const cls = k.state === 'healthy' ? 'ok' : k.state === 'cooldown' ? 'warn' : 'bad';
+      return '<div class="provider-table-row">' +
+        '<div style="display:flex;align-items:center;gap:8px"><span class="status-dot status-' + cls + '"></span><span style="font-weight:500">' + esc(k.provider) + ' / ' + esc(k.id) + '</span></div>' +
+        '<div>' + stateBadge(k.state) + '</div>' +
+        '<div style="font-weight:600">' + rate + '%</div>' +
+        '<div>' + compact(st.total_tokens || 0) + '</div>' +
+        '<div>' + v(st.requests) + '</div>' +
+        '<div><button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="enable">Enable</button></div>' +
+      '</div>';
+    }).join('') + '</div></div>';
+} else {
+  // Card view
+  el('providerCards').innerHTML = providerKeys.map(k => {
+    const st = stats[k.provider + '/' + k.id] || {};
+    const rate = Math.round(num(st.success_rate) * 1000) / 10;
+    const cls = k.state === 'healthy' ? 'ok' : k.state === 'cooldown' ? 'warn' : 'bad';
+    return '<div class="provider-card" data-provider="' + esc(k.provider) + '" data-key="' + esc(k.id) + '">' +
+      '<div class="provider-top"><div class="provider-name"><span class="status-dot status-' + cls + '"></span>' + esc(k.provider) + ' / ' + esc(k.id) + '</div>' + stateBadge(k.state) + '</div>' +
+      '<div class="provider-stats">' +
+        '<div class="provider-stat"><div class="provider-stat-value">' + rate + '%</div><div class="provider-stat-label">Success</div></div>' +
+        '<div class="provider-stat"><div class="provider-stat-value">' + compact(st.total_tokens || 0) + '</div><div class="provider-stat-label">Tokens</div></div>' +
+        '<div class="provider-stat"><div class="provider-stat-value">' + v(st.requests) + '</div><div class="provider-stat-label">Requests</div></div>' +
+      '</div>' +
+      '<div class="provider-bar"><div class="provider-bar-fill" style="width:' + rate + '%;background:' + (rate > 90 ? 'var(--green)' : rate > 70 ? 'var(--amber)' : 'var(--red)') + '"></div></div>' +
+    '</div>';
+  }).join('') || '<div class="empty-state"><div class="empty-state-title">No providers</div></div>';
+}
 
 // Usage Chart
-renderBarChart('usageChart',(s.daily||[]).slice(-14).map(d=>({label:d.date.slice(5),value:d.requests})));
+renderBarChart('usageChart',((usage&&usage.daily)||[]).slice(-14).map(d=>({label:d.date.slice(5),value:d.requests})));
 
 // Incidents
 const incidents=(errors.error_requests||[]).slice(0,5).map(r=>({time:r.created_at,title:r.error_code||'Error',desc:(r.error_message||'').slice(0,100),status:'bad'}));
@@ -2241,7 +2268,7 @@ el('sideStatus').textContent=compact(s.requests)+' requests · '+compact(s.error
 }
 
 // ─── Charts ───
-function renderBarChart(id,data){const max=Math.max(...data.map(d=>d.value),1);const elChart=el(id);if(!elChart)return;elChart.innerHTML='<div class="chart-bar">'+data.map(d=>'<div class="chart-bar-item" style="height:'+(d.value/max*100)+'%" title="'+d.label+': '+compact(d.value)+'"></div>').join('')+'</div><div class="chart-labels">'+data.map(d=>'<div class="chart-label">'+d.label+'</div>').join('')+'</div>';}
+function renderBarChart(id,data){const max=Math.max(...data.map(d=>d.value),1);const elChart=el(id);if(!elChart)return;if(!data.length){elChart.innerHTML='<div class="chart-empty">No data available</div>';return}elChart.innerHTML='<div class="chart-bar">'+data.map(d=>'<div class="chart-bar-item" style="height:'+(d.value/max*100)+'%" title="'+d.label+': '+compact(d.value)+'"></div>').join('')+'</div><div class="chart-labels">'+data.map(d=>'<div class="chart-label">'+d.label+'</div>').join('')+'</div>';}
 
 // ─── Requests ───
 function renderRequests(rows){lastRows=rows||[];
@@ -2367,7 +2394,7 @@ async function createVKey(){const btn=el('vkGenerateBtn');btn.disabled=true;btn.
 
 // ─── Load ───
 async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days=14&limit=20'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?'+qs().toString()));
-renderOverview(s,rows||[],keydata,errors);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);}
+renderOverview(s,rows||[],keydata,errors,usage);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);}
 
 // ─── Events ───
 document.addEventListener('click',e=>{
