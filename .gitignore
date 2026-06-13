@@ -1,7 +1,7 @@
 # Binaries
-gateway
-gateway-fixed
-gateway.new
+/gateway
+/gateway-fixed
+/gateway.new
 *.exe
 *.dll
 *.so
