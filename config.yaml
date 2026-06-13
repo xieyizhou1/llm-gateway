@@ -62,7 +62,10 @@ providers:
       weight: 1
       rpm_limit: 60
       concurrency_limit: 10
-    model_map: {}
+    model_map:
+      kimi-for-coding: deepseek-v4-pro
+      claude-sonnet-4-6: deepseek-v4-pro
+      gpt-5.5: deepseek-v4-pro
 model_capabilities:
   kimi-for-coding:
     upstream_model: kimi-for-coding

@@ -1,0 +1,64 @@
+server:
+  host: "127.0.0.1"
+  port: 8080
+
+auth:
+  disabled: false
+  virtual_keys:
+    - key: "${LG_LOCAL_VIRTUAL_KEY}"
+      allowed_models:
+        - "claude-sonnet"
+        - "claude-sonnet-4-6"
+        - "claude-opus-4-7"
+        - "claude-3-5-sonnet"
+        - "claude-3-5-sonnet-20241022"
+        - "claude-3-7-sonnet"
+        - "claude-3-7-sonnet-20250219"
+        - "sonnet"
+        - "kimi-for-coding"
+        - "gpt-4o"
+        - "gpt-4"
+        - "gpt-5.4"
+        - "gpt-5.5"
+        - "deepseek-chat"
+        - "deepseek-v4-pro"
+      rpm_limit: 100
+
+providers:
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    keys:
+      - id: "deepseek-1"
+        key: "${DEEPSEEK_KEY_1}"
+        weight: 1
+        rpm_limit: 60
+    model_map:
+      "gpt-4o": "deepseek-v4-pro"
+      "gpt-4": "deepseek-v4-pro"
+      "gpt-5.4": "deepseek-v4-pro"
+      "gpt-5.5": "deepseek-v4-pro"
+      "claude-sonnet": "deepseek-v4-pro"
+      "claude-sonnet-4-6": "deepseek-v4-pro"
+      "claude-opus-4-7": "deepseek-v4-pro"
+      "claude-3-5-sonnet": "deepseek-v4-pro"
+      "claude-3-5-sonnet-20241022": "deepseek-v4-pro"
+      "claude-3-7-sonnet": "deepseek-v4-pro"
+      "claude-3-7-sonnet-20250219": "deepseek-v4-pro"
+      "sonnet": "deepseek-v4-pro"
+      "kimi-for-coding": "deepseek-v4-pro"
+      "deepseek-chat": "deepseek-v4-pro"
+      "deepseek-v4-pro": "deepseek-v4-pro"
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+
+router:
+  strategy: "round_robin"
+  retry_count: 2
+  timeout_seconds: 120
+
+logging:
+  level: "INFO"
+  format: "json"
