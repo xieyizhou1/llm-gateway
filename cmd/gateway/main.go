@@ -1861,8 +1861,14 @@ html,body{height:100%;font-family:var(--font-sans);font-size:14px;line-height:1.
 /* ─── Tables ─── */
 .table-wrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
-thaad,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border-2);white-space:nowrap}
-thaad{font-size:11px;font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.03em;background:var(--surface-2)}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border-2);white-space:nowrap}
+th{font-size:11px;font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.03em;background:var(--surface-2)}
+.data-grid{display:grid;gap:0;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border-2);font-size:13px}
+.data-grid-head{display:grid;gap:0;padding:10px 14px;background:var(--surface-2);border-bottom:1px solid var(--border-2);font-size:11px;font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.03em}
+.data-grid-head>div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.data-grid>div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.data-grid:hover{background:var(--surface-2)}
+.data-grid .cell-mono{font-family:var(--font-mono);font-size:12px}
 tbody tr{cursor:pointer;transition:background .1s}
 tbody tr:hover{background:var(--surface-2)}
 tbody tr.active{background:var(--surface-3)}
@@ -1874,13 +1880,21 @@ tbody tr.active{background:var(--surface-3)}
 .badge-gray{background:var(--surface-3);color:var(--text-2)}
 
 /* ─── Charts ─── */
-.chart-container{height:180px;position:relative;margin-top:12px}
+.chart-container{height:200px;position:relative;margin-top:12px}
 .chart-bar{display:flex;align-items:flex-end;gap:3px;height:100%;padding:0 4px}
 .chart-bar-item{flex:1;background:var(--accent);border-radius:3px 3px 0 0;opacity:.7;transition:opacity .2s;min-width:4px}
 .chart-bar-item:hover{opacity:1}
 .chart-labels{display:flex;gap:3px;padding:0 4px;margin-top:6px}
 .chart-label{flex:1;text-align:center;font-size:10px;color:var(--text-3);min-width:4px;overflow:hidden;text-overflow:ellipsis}
 .chart-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-3);font-size:13px}
+.line-chart{position:relative;height:100%;padding:0 8px}
+.line-chart svg{width:100%;height:100%;overflow:visible}
+.line-chart .line{fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.line-chart .area{fill:var(--accent);opacity:.1}
+.line-chart .dot{fill:var(--accent);r:3}
+.line-chart .axis{stroke:var(--border);stroke-width:1}
+.line-chart .grid{stroke:var(--border-2);stroke-width:1;stroke-dasharray:2,2}
+.line-chart .axis-label{font-size:10px;fill:var(--text-3)}
 
 /* ─── Drawers ─── */
 .drawer{position:fixed;inset:0 0 0 auto;width:min(520px,100vw);background:var(--surface);box-shadow:var(--shadow-lg);z-index:100;transform:translateX(100%);transition:transform .3s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column}
@@ -2049,22 +2063,12 @@ tbody tr.active{background:var(--surface-3)}
     <!-- REQUESTS -->
     <section id="requests" class="view">
       <div class="metric-grid" id="requestMetrics" style="grid-template-columns:repeat(4,1fr)"></div>
-      <div class="filter-bar">
-        <input id="rProvider" placeholder="Provider">
-        <input id="rKey" placeholder="Key ID">
-        <input id="rModel" placeholder="Model">
-        <input id="rUser" placeholder="User">
-        <select id="rStatus"><option value="">All Status</option><option value="success">Success</option><option value="error">Error</option></select>
-        <button class="btn btn-primary" id="rFilterBtn">Filter</button>
-      </div>
       <div class="card">
-        <div class="table-wrap">
-          <table>
-            <thead><tr>
-              <th>Time</th><th>Trace</th><th>User</th><th>Status</th><th>Model</th><th>Prompt</th><th>Completion</th><th>Cache</th><th>Latency</th><th>Error</th>
-            </tr></thead>
-            <tbody id="requestRows"></tbody>
-          </table>
+        <div class="card-body" style="padding:0">
+          <div class="data-grid-head" style="grid-template-columns:130px 100px 100px 80px minmax(140px,1fr) 80px 90px 80px 80px 120px">
+            <div>Time</div><div>Trace</div><div>User</div><div>Status</div><div>Model</div><div>Prompt</div><div>Completion</div><div>Cache</div><div>Latency</div><div>Error</div>
+          </div>
+          <div id="requestRows"></div>
         </div>
       </div>
     </section>
@@ -2078,18 +2082,18 @@ tbody tr.active{background:var(--surface-3)}
       </div>
       <div class="metric-grid" id="usageMetrics"></div>
       <div class="card" style="margin-bottom:24px">
-        <div class="card-head"><div class="card-title">Token Distribution</div></div>
+        <div class="card-head"><div class="card-title">Token Trend</div></div>
         <div class="card-body">
           <div class="chart-container" id="tokenChart"></div>
         </div>
       </div>
       <div class="card">
         <div class="card-head"><div class="card-title">Daily Usage</div></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Date</th><th>Requests</th><th>Errors</th><th>Prompt</th><th>Completion</th><th>Total</th><th>Cost</th></tr></thead>
-            <tbody id="usageRows"></tbody>
-          </table>
+        <div class="card-body" style="padding:0">
+          <div class="data-grid-head" style="grid-template-columns:120px 90px 90px 110px 110px 110px">
+            <div>Date</div><div>Requests</div><div>Errors</div><div>Prompt</div><div>Completion</div><div>Total</div>
+          </div>
+          <div id="usageRows"></div>
         </div>
       </div>
     </section>
@@ -2134,11 +2138,11 @@ tbody tr.active{background:var(--surface-3)}
       </div>
       <div class="card">
         <div class="card-head"><div class="card-title">Recent Errors</div></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Time</th><th>Trace</th><th>Status</th><th>Code</th><th>Message</th></tr></thead>
-            <tbody id="errorRows"></tbody>
-          </table>
+        <div class="card-body" style="padding:0">
+          <div class="data-grid-head" style="grid-template-columns:140px 100px 80px 110px minmax(160px,1fr)">
+            <div>Time</div><div>Trace</div><div>Status</div><div>Code</div><div>Message</div>
+          </div>
+          <div id="errorRows"></div>
         </div>
       </div>
     </section>
@@ -2166,8 +2170,8 @@ const h=token?{'X-Dashboard-Token':token}:{};
 const el=id=>document.getElementById(id);
 let lastRows=[],currentPeriod='today';
 
+function periodDays(){switch(currentPeriod){case'today':return 1;case'week':return 7;case'month':return 30;default:return 1}}
 function api(path){const u=new URL(path,location.origin);if(token)u.searchParams.set('token',token);return u.pathname+u.search}
-function qs(){const u=new URLSearchParams();['provider','provider_key_id','model','user','status'].forEach(id=>{const n=el('r'+id.charAt(0).toUpperCase()+id.slice(1));if(!n)return;const v=n?n.value:'';if(v)u.set(id,v)});u.set('limit','100');if(token)u.set('token',token);return u}
 function money(c){return'$'+((c||0)/100).toFixed(4)}
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function v(x,d){return x==null?(d==null?0:d):x}
@@ -2176,6 +2180,7 @@ function dt(x){return x?new Date(x).toLocaleString('en-US',{month:'short',day:'n
 function shortTrace(x){return x?String(x).slice(0,8):''}
 function pct(x){return x==null?'0%':(Math.round(num(x)*1000)/10)+'%'}
 function compact(n){n=num(n);if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(Math.round(n))}
+function dateLabel(x){return x?new Date(x).toLocaleDateString('en-US',{month:'short',day:'numeric'}):''}
 function jsonHeaders(){return Object.assign({'Content-Type':'application/json'},h)}
 async function j(url,opt){const r=await fetch(url,opt||{headers:h});const text=await r.text();if(!r.ok)throw new Error(text||r.statusText);return text?JSON.parse(text):{}}
 
@@ -2271,6 +2276,50 @@ el('sideStatus').textContent=compact(s.requests)+' requests · '+compact(s.error
 // ─── Charts ───
 function renderBarChart(id,data){const max=Math.max(...data.map(d=>d.value),1);const elChart=el(id);if(!elChart)return;if(!data.length){elChart.innerHTML='<div class="chart-empty">No data available</div>';return}elChart.innerHTML='<div class="chart-bar">'+data.map(d=>'<div class="chart-bar-item" style="height:'+(d.value/max*100)+'%" title="'+d.label+': '+compact(d.value)+'"></div>').join('')+'</div><div class="chart-labels">'+data.map(d=>'<div class="chart-label">'+d.label+'</div>').join('')+'</div>';}
 
+function renderLineChart(id, series) {
+  const container = el(id);
+  if (!container) return;
+  if (!series || !series.length || !series[0].data || !series[0].data.length) {
+    container.innerHTML = '<div class="chart-empty">No data available</div>';
+    return;
+  }
+  const labels = series[0].data.map(d => d.label);
+  const width = 800, height = 200, padL = 46, padR = 12, padT = 10, padB = 28;
+  const chartW = width - padL - padR, chartH = height - padT - padB;
+  const allValues = series.flatMap(s => s.data.map(d => d.value));
+  const maxY = Math.max(...allValues, 1);
+  const niceMax = (() => { const p = Math.pow(10, Math.floor(Math.log10(maxY))); const n = Math.ceil(maxY / p); return n <= 2 ? 2 * p : n <= 5 ? 5 * p : 10 * p; })();
+  const x = i => padL + (i / (labels.length - 1 || 1)) * chartW;
+  const y = v => padT + chartH - (v / niceMax) * chartH;
+  let svg = '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">';
+  const gridCount = 5;
+  for (let i = 0; i <= gridCount; i++) {
+    const gy = padT + (i / gridCount) * chartH;
+    const gv = Math.round(niceMax * (1 - i / gridCount));
+    svg += '<line class="grid" x1="' + padL + '" y1="' + gy + '" x2="' + (width - padR) + '" y2="' + gy + '"/>';
+    svg += '<text class="axis-label" x="' + (padL - 8) + '" y="' + (gy + 3) + '" text-anchor="end">' + compact(gv) + '</text>';
+  }
+  svg += '<line class="axis" x1="' + padL + '" y1="' + (height - padB) + '" x2="' + (width - padR) + '" y2="' + (height - padB) + '"/>';
+  const colors = ['var(--accent)', '#17c964', '#f5a623', '#ef4444'];
+  series.forEach((s, si) => {
+    const color = s.color || colors[si % colors.length];
+    let points = s.data.map((d, i) => [x(i), y(d.value)]);
+    if (points.length === 1) points.push([padL + chartW, points[0][1]]);
+    const areaPath = 'M ' + points[0][0] + ' ' + (height - padB) + ' L ' + points.map(p => p[0] + ' ' + p[1]).join(' L ') + ' L ' + points[points.length - 1][0] + ' ' + (height - padB) + ' Z';
+    const linePath = 'M ' + points.map(p => p[0] + ' ' + p[1]).join(' L ');
+    svg += '<path class="area" style="fill:' + color + '" d="' + areaPath + '"/>';
+    svg += '<path class="line" style="stroke:' + color + '" d="' + linePath + '"/>';
+    points.forEach(p => { svg += '<circle class="dot" style="fill:' + color + '" cx="' + p[0] + '" cy="' + p[1] + '"/>'; });
+  });
+  const step = Math.ceil(labels.length / 7);
+  labels.forEach((l, i) => {
+    if (i % step !== 0 && i !== labels.length - 1) return;
+    svg += '<text class="axis-label" x="' + x(i) + '" y="' + (height - 8) + '" text-anchor="middle">' + esc(l) + '</text>';
+  });
+  svg += '</svg>';
+  container.innerHTML = '<div class="line-chart">' + svg + '</div>';
+}
+
 // ─── Requests ───
 function renderRequests(rows){lastRows=rows||[];
 const success=lastRows.filter(r=>r.status_code<400).length;
@@ -2283,26 +2332,26 @@ el('requestMetrics').innerHTML=
   metricCard('Avg Latency',avgLatency+' ms','p50')+
   metricCard('Avg TTFT',avgTTFT+' ms','p50');
 
-el('requestRows').innerHTML=lastRows.map((r,i)=>'<tr data-idx="'+i+'"><td>'+dt(r.created_at)+'</td><td class="cell-mono" title="'+esc(r.trace_id)+'">'+esc(shortTrace(r.trace_id))+'</td><td>'+esc(r.user)+'</td><td>'+statusBadge(r.status_code)+'</td><td>'+esc(r.model)+'</td><td>'+compact(r.prompt_tokens)+'</td><td>'+compact(r.output_tokens)+'</td><td>'+pct(r.cache_hit_rate)+'</td><td>'+v(r.latency_ms)+' ms</td><td>'+esc(r.error_code)+'</td></tr>').join('')||'<tr><td colspan="10" class="empty-state">No requests</td></tr>';
+el('requestRows').innerHTML=lastRows.map((r,i)=>'<div class="data-grid" data-idx="'+i+'" style="grid-template-columns:130px 100px 100px 80px minmax(140px,1fr) 80px 90px 80px 80px 120px;cursor:pointer"><div>'+dt(r.created_at)+'</div><div class="cell-mono" title="'+esc(r.trace_id)+'">'+esc(shortTrace(r.trace_id))+'</div><div>'+esc(r.user)+'</div><div>'+statusBadge(r.status_code)+'</div><div title="'+esc(r.model)+'">'+esc(r.model)+'</div><div>'+compact(r.prompt_tokens)+'</div><div>'+compact(r.output_tokens)+'</div><div>'+pct(r.cache_hit_rate)+'</div><div>'+v(r.latency_ms)+' ms</div><div>'+esc(r.error_code)+'</div></div>').join('')||'<div class="empty-state" style="padding:40px 20px">No requests</div>';
 }
 
 // ─── Usage ───
-function renderUsage(usage){const mix=usage.token_mix||{};
-const today=usage.daily?.[usage.daily.length-1]||{};
+function renderUsage(usage){
+const daily=usage.daily||[];
+const today=daily[0]||{};
+const totals=daily.reduce((a,d)=>({requests:a.requests+num(d.requests),errors:a.errors+num(d.errors),prompt:a.prompt+num(d.prompt_tokens),completion:a.completion+num(d.output_tokens)}),{requests:0,errors:0,prompt:0,completion:0});
 el('usageMetrics').innerHTML=
-  metricCard('Prompt Tokens',compact(today.prompt_tokens||0),'today')+
-  metricCard('Completion',compact(today.output_tokens||0),'today')+
-  metricCard('Cache Read',compact(today.cache_read_tokens||0),'today')+
-  metricCard('Cost',money(today.cost_cents),'today');
+  metricCard('Total Requests',compact(totals.requests),currentPeriod)+
+  metricCard('Prompt Tokens',compact(totals.prompt),currentPeriod)+
+  metricCard('Completion',compact(totals.completion),currentPeriod)+
+  metricCard('Errors',compact(totals.errors),currentPeriod);
 
-renderBarChart('tokenChart',[
-  {label:'Prompt',value:mix.prompt_tokens||0},
-  {label:'Completion',value:mix.output_tokens||0},
-  {label:'Cache R',value:mix.cache_read_tokens||0},
-  {label:'Cache W',value:mix.cache_write_tokens||0}
+renderLineChart('tokenChart',[
+  {label:'Prompt',color:'var(--accent)',data:daily.slice().reverse().map(d=>({label:d.date.slice(5),value:num(d.prompt_tokens)}))},
+  {label:'Completion',color:'#17c964',data:daily.slice().reverse().map(d=>({label:d.date.slice(5),value:num(d.output_tokens)}))}
 ]);
 
-el('usageRows').innerHTML=(usage.daily||[]).map(d=>'<tr><td>'+esc(d.date)+'</td><td>'+compact(d.requests)+'</td><td>'+compact(d.errors)+'</td><td>'+compact(d.prompt_tokens)+'</td><td>'+compact(d.output_tokens)+'</td><td>'+compact(num(d.prompt_tokens)+num(d.output_tokens))+'</td><td>'+money(d.cost_cents)+'</td></tr>').join('')||'<tr><td colspan="7" class="empty-state">No data</td></tr>';
+el('usageRows').innerHTML=(usage.daily||[]).map(d=>'<div class="data-grid" style="grid-template-columns:120px 90px 90px 110px 110px 110px"><div>'+esc(d.date)+'</div><div>'+compact(d.requests)+'</div><div>'+compact(d.errors)+'</div><div>'+compact(d.prompt_tokens)+'</div><div>'+compact(d.output_tokens)+'</div><div>'+compact(num(d.prompt_tokens)+num(d.output_tokens))+'</div></div>').join('')||'<div class="empty-state" style="padding:40px 20px">No data</div>';
 }
 
 // ─── Providers ───
@@ -2356,7 +2405,7 @@ el('vkRows').innerHTML=(vkeys||[]).map(k=>{
 }
 
 // ─── Errors ───
-function renderErrors(errors){const breakdown=errors.breakdown||[];const total=breakdown.reduce((a,b)=>a+num(b.count),0);
+function renderErrors(errors){const breakdown=(errors.breakdown||[]).filter(b=>num(b.status_code)>=400);const total=breakdown.reduce((a,b)=>a+num(b.count),0);
 const byCode={};breakdown.forEach(b=>{byCode[b.status_code]=num(byCode[b.status_code])+num(b.count)});
 el('errorMetrics').innerHTML=
   metricCard('Total Errors',compact(total),'24h')+
@@ -2366,8 +2415,8 @@ el('errorMetrics').innerHTML=
 
 renderBarChart('errorChart',breakdown.slice(0,10).map(b=>({label:String(b.status_code),value:b.count})));
 
-const errorRows=[].concat(errors.error_requests||[],errors.slow_requests||[]).filter((r,i,a)=>a.findIndex(x=>x.trace_id===r.trace_id)===i).slice(0,50);
-el('errorRows').innerHTML=errorRows.map(r=>'<tr><td>'+dt(r.created_at)+'</td><td class="cell-mono" title="'+esc(r.trace_id)+'">'+esc(shortTrace(r.trace_id))+'</td><td>'+statusBadge(r.status_code)+'</td><td>'+esc(r.error_code)+'</td><td title="'+esc(r.error_message)+'">'+esc((r.error_message||'').slice(0,80))+'</td></tr>').join('')||'<tr><td colspan="5" class="empty-state">No errors</td></tr>';
+const errorRows=(errors.error_requests||[]).filter(r=>num(r.status_code)>=400).slice(0,50);
+el('errorRows').innerHTML=errorRows.map(r=>'<div class="data-grid" style="grid-template-columns:140px 100px 80px 110px minmax(160px,1fr)"><div>'+dt(r.created_at)+'</div><div class="cell-mono" title="'+esc(r.trace_id)+'">'+esc(shortTrace(r.trace_id))+'</div><div>'+statusBadge(r.status_code)+'</div><div>'+esc(r.error_code)+'</div><div title="'+esc(r.error_message)+'">'+esc((r.error_message||'').slice(0,80))+'</div></div>').join('')||'<div class="empty-state" style="padding:40px 20px">No errors</div>';
 }
 
 // ─── Request Detail Drawer ───
@@ -2394,7 +2443,7 @@ async function vkeyAction(id,a){await fetch(api('/dashboard/api/virtual-keys/'+i
 async function createVKey(){const btn=el('vkGenerateBtn');btn.disabled=true;btn.textContent='...';try{const body={user:el('vkUser').value||'default',allowed_models:el('vkModels').value.split(',').map(x=>x.trim()).filter(Boolean),rpm_limit:parseInt(el('vkRpm').value||'100'),tpm_limit:parseInt(el('vkTpm').value||'200000'),concurrency_limit:parseInt(el('vkConc').value||'10')};const data=await j(api('/dashboard/api/virtual-keys'),{method:'POST',headers:jsonHeaders(),body:JSON.stringify(body)});if(data&&data.api_key){el('vkGenerated').innerHTML='<div style="background:var(--green-bg);border:1px solid rgba(23,201,100,.2);border-radius:var(--radius-sm);padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px"><div><div style="font-size:12px;font-weight:500;color:var(--green);margin-bottom:4px">New key generated</div><div class="cell-mono" style="font-size:13px">'+esc(data.api_key)+'</div></div><button class="btn btn-primary" id="vkCopyBtn">Copy</button></div>';el('vkGenerated').style.display='block';el('vkCopyBtn').addEventListener('click',()=>navigator.clipboard.writeText(data.api_key));load();return}throw new Error('No key')}catch(e){el('vkGenerated').innerHTML='<div style="background:var(--red-bg);border:1px solid rgba(239,68,68,.2);border-radius:var(--radius-sm);padding:12px 16px;color:var(--red);font-size:13px">'+esc(e.message)+'</div>';el('vkGenerated').style.display='block'}finally{btn.disabled=false;btn.textContent='Generate Key'}}
 
 // ─── Load ───
-async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days=14&limit=20'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?'+qs().toString()));
+async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days='+periodDays()+'&limit=30'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?limit=100'));
 renderOverview(s,rows||[],keydata,errors,usage);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);}
 
 // ─── Events ───
@@ -2402,12 +2451,12 @@ document.addEventListener('click',e=>{
   const n=e.target.closest('[data-view]');if(n)setView(n.dataset.view);
   const p=e.target.closest('[data-p][data-a]');if(p)keyAction(p.dataset.p,p.dataset.k,p.dataset.a).catch(()=>{});
   const k=e.target.closest('[data-id][data-a]');if(k)vkeyAction(k.dataset.id,k.dataset.a).catch(()=>{});
-  const tr=e.target.closest('tr[data-idx]');if(tr){const r=lastRows[Number(tr.dataset.idx)];if(r)showRequestDetail(r)}
+  const row=e.target.closest('[data-idx]');if(row){const r=lastRows[Number(row.dataset.idx)];if(r)showRequestDetail(r)}
   const pc=e.target.closest('.provider-card');if(pc){/* TODO: provider detail */}
 });
 
 el('refreshBtn').addEventListener('click',()=>load().catch(()=>{}));
-el('rFilterBtn').addEventListener('click',()=>load().catch(()=>{}));
+el('exportBtn').addEventListener('click',e=>{e.preventDefault();const a=document.createElement('a');a.href=api('/dashboard/api/requests.csv');a.download='requests.csv';a.click();});
 el('vkGenerateBtn').addEventListener('click',createVKey);
 
 // Tab switching
