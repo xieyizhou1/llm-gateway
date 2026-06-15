@@ -631,10 +631,15 @@ func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *rou
 			buf := make([]byte, 4096)
 			var pending []byte
 			streamState := newAnthropicStreamState()
+			firstByte := true
 
 			for {
 				n, err := reader.Read(buf)
 				if n > 0 {
+					if firstByte {
+						firstByte = false
+						markTTFT(record, start)
+					}
 					pending = append(pending, buf[:n]...)
 					for {
 						idx := findDoubleNewline(pending)
@@ -1880,12 +1885,12 @@ tbody tr.active{background:var(--surface-3)}
 .badge-gray{background:var(--surface-3);color:var(--text-2)}
 
 /* ─── Charts ─── */
-.chart-container{height:200px;position:relative;margin-top:12px}
-.chart-bar{display:flex;align-items:flex-end;gap:3px;height:100%;padding:0 4px}
-.chart-bar-item{flex:1;background:var(--accent);border-radius:3px 3px 0 0;opacity:.7;transition:opacity .2s;min-width:4px}
+.chart-container{display:flex;flex-direction:column;height:200px;position:relative;margin-top:12px}
+.chart-bar{display:flex;align-items:flex-end;gap:3px;flex:1;min-height:0;padding:0 4px}
+.chart-bar-item{flex:1;background:var(--accent);border-radius:3px 3px 0 0;opacity:.7;transition:opacity .2s;min-width:3px}
 .chart-bar-item:hover{opacity:1}
-.chart-labels{display:flex;gap:3px;padding:0 4px;margin-top:6px}
-.chart-label{flex:1;text-align:center;font-size:10px;color:var(--text-3);min-width:4px;overflow:hidden;text-overflow:ellipsis}
+.chart-labels{display:flex;gap:3px;flex-shrink:0;height:22px;padding:0 4px}
+.chart-label{flex:1;text-align:center;font-size:10px;color:var(--text-3);line-height:22px;min-width:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chart-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-3);font-size:13px}
 .line-chart{position:relative;height:100%;padding:0 8px}
 .line-chart svg{width:100%;height:100%;overflow:visible}
@@ -2065,8 +2070,8 @@ tbody tr.active{background:var(--surface-3)}
       <div class="metric-grid" id="requestMetrics" style="grid-template-columns:repeat(4,1fr)"></div>
       <div class="card">
         <div class="card-body" style="padding:0">
-          <div class="data-grid-head" style="grid-template-columns:130px 100px 100px 80px minmax(140px,1fr) 80px 90px 80px 80px 120px">
-            <div>Time</div><div>Trace</div><div>User</div><div>Status</div><div>Model</div><div>Prompt</div><div>Completion</div><div>Cache</div><div>Latency</div><div>Error</div>
+          <div class="data-grid-head" style="grid-template-columns:130px 100px 100px 80px minmax(140px,1fr) 80px 90px 80px 80px 80px 100px">
+            <div>Time</div><div>Trace</div><div>User</div><div>Status</div><div>Model</div><div>Prompt</div><div>Completion</div><div>Cache</div><div>Latency</div><div>TTFT</div><div>Error</div>
           </div>
           <div id="requestRows"></div>
         </div>
@@ -2085,6 +2090,12 @@ tbody tr.active{background:var(--surface-3)}
         <div class="card-head"><div class="card-title">Token Trend</div></div>
         <div class="card-body">
           <div class="chart-container" id="tokenChart"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:24px">
+        <div class="card-head"><div class="card-title">Request Trend</div></div>
+        <div class="card-body">
+          <div class="chart-container" id="requestChart"></div>
         </div>
       </div>
       <div class="card">
@@ -2200,7 +2211,7 @@ function healthCard(icon,status,title,desc,meta){const cls=status==='ok'?'ok':st
 function metricCard(label,value,hint,delta){return'<div class="metric-card"><div class="metric-label">'+label+'</div><div class="metric-value">'+value+'</div><div class="metric-hint">'+hint+(delta?'<span class="metric-delta '+delta.cls+'">'+delta.text+'</span>':'')+'</div></div>'}
 
 // ─── Overview ───
-function renderOverview(s,rows,keydata,errors,usage){const avgCache=rows.length?rows.reduce((a,r)=>a+num(r.cache_hit_rate),0)/rows.length:0;const slow=rows.filter(r=>r.slow_reason||num(r.status_code)>=400).length;const errorRate=rows.length?Math.round(slow/rows.length*1000)/10:0;
+function renderOverview(s,rows,keydata,errors,usageOverview){const avgCache=rows.length?rows.reduce((a,r)=>a+num(r.cache_hit_rate),0)/rows.length:0;const slow=rows.filter(r=>r.slow_reason||num(r.status_code)>=400).length;const errorRate=rows.length?Math.round(slow/rows.length*1000)/10:0;
 
 // Health Cards
 const providers=(keydata.keys||[]).map(k=>k.provider).filter((v,i,a)=>a.indexOf(v)===i);
@@ -2242,7 +2253,7 @@ if (providerKeys.length > 4) {
         '<div style="font-weight:600">' + rate + '%</div>' +
         '<div>' + compact(st.total_tokens || 0) + '</div>' +
         '<div>' + v(st.requests) + '</div>' +
-        '<div><button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="enable">Enable</button></div>' +
+        '<div><button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="enable">Enable</button> <button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="cooldown">Cooldown</button> <button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="disable">Disable</button></div>' +
       '</div>';
     }).join('') + '</div></div>';
 } else {
@@ -2264,7 +2275,7 @@ if (providerKeys.length > 4) {
 }
 
 // Usage Chart
-renderBarChart('usageChart',((usage&&usage.daily)||[]).slice(-14).map(d=>({label:d.date.slice(5),value:d.requests})));
+renderBarChart('usageChart',((usageOverview&&usageOverview.daily)||[]).slice(-14).map(d=>({label:d.date.slice(5),value:d.requests})));
 
 // Incidents
 const incidents=(errors.error_requests||[]).slice(0,5).map(r=>({time:r.created_at,title:r.error_code||'Error',desc:(r.error_message||'').slice(0,100),status:'bad'}));
@@ -2291,6 +2302,25 @@ function renderLineChart(id, series) {
   const niceMax = (() => { const p = Math.pow(10, Math.floor(Math.log10(maxY))); const n = Math.ceil(maxY / p); return n <= 2 ? 2 * p : n <= 5 ? 5 * p : 10 * p; })();
   const x = i => padL + (i / (labels.length - 1 || 1)) * chartW;
   const y = v => padT + chartH - (v / niceMax) * chartH;
+
+  function smoothPath(points) {
+    if (points.length <= 1) return '';
+    if (points.length === 2) return 'M ' + points[0][0] + ' ' + points[0][1] + ' L ' + points[1][0] + ' ' + points[1][1];
+    let d = 'M ' + points[0][0] + ' ' + points[0][1];
+    for (let i = 0; i < points.length - 1; i++) {
+      const p0 = points[i === 0 ? 0 : i - 1];
+      const p1 = points[i];
+      const p2 = points[i + 1];
+      const p3 = points[i + 2 >= points.length ? points.length - 1 : i + 2];
+      const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+      const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+      const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+      const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+      d += ' C ' + cp1x + ' ' + cp1y + ', ' + cp2x + ' ' + cp2y + ', ' + p2[0] + ' ' + p2[1];
+    }
+    return d;
+  }
+
   let svg = '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">';
   const gridCount = 5;
   for (let i = 0; i <= gridCount; i++) {
@@ -2306,9 +2336,9 @@ function renderLineChart(id, series) {
     let points = s.data.map((d, i) => [x(i), y(d.value)]);
     if (points.length === 1) points.push([padL + chartW, points[0][1]]);
     const areaPath = 'M ' + points[0][0] + ' ' + (height - padB) + ' L ' + points.map(p => p[0] + ' ' + p[1]).join(' L ') + ' L ' + points[points.length - 1][0] + ' ' + (height - padB) + ' Z';
-    const linePath = 'M ' + points.map(p => p[0] + ' ' + p[1]).join(' L ');
+    const lineD = smoothPath(points);
     svg += '<path class="area" style="fill:' + color + '" d="' + areaPath + '"/>';
-    svg += '<path class="line" style="stroke:' + color + '" d="' + linePath + '"/>';
+    if (lineD) svg += '<path class="line" style="stroke:' + color + '" d="' + lineD + '"/>';
     points.forEach(p => { svg += '<circle class="dot" style="fill:' + color + '" cx="' + p[0] + '" cy="' + p[1] + '"/>'; });
   });
   const step = Math.ceil(labels.length / 7);
@@ -2332,7 +2362,7 @@ el('requestMetrics').innerHTML=
   metricCard('Avg Latency',avgLatency+' ms','p50')+
   metricCard('Avg TTFT',avgTTFT+' ms','p50');
 
-el('requestRows').innerHTML=lastRows.map((r,i)=>'<div class="data-grid" data-idx="'+i+'" style="grid-template-columns:130px 100px 100px 80px minmax(140px,1fr) 80px 90px 80px 80px 120px;cursor:pointer"><div>'+dt(r.created_at)+'</div><div class="cell-mono" title="'+esc(r.trace_id)+'">'+esc(shortTrace(r.trace_id))+'</div><div>'+esc(r.user)+'</div><div>'+statusBadge(r.status_code)+'</div><div title="'+esc(r.model)+'">'+esc(r.model)+'</div><div>'+compact(r.prompt_tokens)+'</div><div>'+compact(r.output_tokens)+'</div><div>'+pct(r.cache_hit_rate)+'</div><div>'+v(r.latency_ms)+' ms</div><div>'+esc(r.error_code)+'</div></div>').join('')||'<div class="empty-state" style="padding:40px 20px">No requests</div>';
+el('requestRows').innerHTML=lastRows.map((r,i)=>'<div class="data-grid" data-idx="'+i+'" style="grid-template-columns:130px 100px 100px 80px minmax(140px,1fr) 80px 90px 80px 80px 80px 100px;cursor:pointer"><div>'+dt(r.created_at)+'</div><div class="cell-mono" title="'+esc(r.trace_id)+'">'+esc(shortTrace(r.trace_id))+'</div><div>'+esc(r.user)+'</div><div>'+statusBadge(r.status_code)+'</div><div title="'+esc(r.model)+'">'+esc(r.model)+'</div><div>'+compact(r.prompt_tokens)+'</div><div>'+compact(r.output_tokens)+'</div><div>'+pct(r.cache_hit_rate)+'</div><div>'+v(r.latency_ms)+' ms</div><div>'+(r.ttft_ms?v(r.ttft_ms)+' ms':'-')+'</div><div>'+esc(r.error_code)+'</div></div>').join('')||'<div class="empty-state" style="padding:40px 20px">No requests</div>';
 }
 
 // ─── Usage ───
@@ -2349,6 +2379,11 @@ el('usageMetrics').innerHTML=
 renderLineChart('tokenChart',[
   {label:'Prompt',color:'var(--accent)',data:daily.slice().reverse().map(d=>({label:d.date.slice(5),value:num(d.prompt_tokens)}))},
   {label:'Completion',color:'#17c964',data:daily.slice().reverse().map(d=>({label:d.date.slice(5),value:num(d.output_tokens)}))}
+]);
+
+renderLineChart('requestChart',[
+  {label:'Requests',color:'var(--accent)',data:daily.slice().reverse().map(d=>({label:d.date.slice(5),value:num(d.requests)}))},
+  {label:'Errors',color:'#ef4444',data:daily.slice().reverse().map(d=>({label:d.date.slice(5),value:num(d.errors)}))}
 ]);
 
 el('usageRows').innerHTML=(usage.daily||[]).map(d=>'<div class="data-grid" style="grid-template-columns:120px 90px 90px 110px 110px 110px"><div>'+esc(d.date)+'</div><div>'+compact(d.requests)+'</div><div>'+compact(d.errors)+'</div><div>'+compact(d.prompt_tokens)+'</div><div>'+compact(d.output_tokens)+'</div><div>'+compact(num(d.prompt_tokens)+num(d.output_tokens))+'</div></div>').join('')||'<div class="empty-state" style="padding:40px 20px">No data</div>';
@@ -2443,8 +2478,8 @@ async function vkeyAction(id,a){await fetch(api('/dashboard/api/virtual-keys/'+i
 async function createVKey(){const btn=el('vkGenerateBtn');btn.disabled=true;btn.textContent='...';try{const body={user:el('vkUser').value||'default',allowed_models:el('vkModels').value.split(',').map(x=>x.trim()).filter(Boolean),rpm_limit:parseInt(el('vkRpm').value||'100'),tpm_limit:parseInt(el('vkTpm').value||'200000'),concurrency_limit:parseInt(el('vkConc').value||'10')};const data=await j(api('/dashboard/api/virtual-keys'),{method:'POST',headers:jsonHeaders(),body:JSON.stringify(body)});if(data&&data.api_key){el('vkGenerated').innerHTML='<div style="background:var(--green-bg);border:1px solid rgba(23,201,100,.2);border-radius:var(--radius-sm);padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px"><div><div style="font-size:12px;font-weight:500;color:var(--green);margin-bottom:4px">New key generated</div><div class="cell-mono" style="font-size:13px">'+esc(data.api_key)+'</div></div><button class="btn btn-primary" id="vkCopyBtn">Copy</button></div>';el('vkGenerated').style.display='block';el('vkCopyBtn').addEventListener('click',()=>navigator.clipboard.writeText(data.api_key));load();return}throw new Error('No key')}catch(e){el('vkGenerated').innerHTML='<div style="background:var(--red-bg);border:1px solid rgba(239,68,68,.2);border-radius:var(--radius-sm);padding:12px 16px;color:var(--red);font-size:13px">'+esc(e.message)+'</div>';el('vkGenerated').style.display='block'}finally{btn.disabled=false;btn.textContent='Generate Key'}}
 
 // ─── Load ───
-async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days='+periodDays()+'&limit=30'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?limit=100'));
-renderOverview(s,rows||[],keydata,errors,usage);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);}
+async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days='+periodDays()+'&limit=30'));const usageOverview=await j(api('/dashboard/api/usage?days=14&limit=14'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?limit=100'));
+renderOverview(s,rows||[],keydata,errors,usageOverview);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);}
 
 // ─── Events ───
 document.addEventListener('click',e=>{
