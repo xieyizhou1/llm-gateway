@@ -566,6 +566,7 @@ func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *rou
 				record.CacheWriteTokens = cacheUsage.CacheWriteTokens
 				record.CacheHitRate = cacheUsage.CacheHitRate
 				record.OutputHash = outputHash
+				record.FinishReason = anthropicResp.StopReason
 				logger.Audit(traceID, "llm_call", map[string]interface{}{
 					"model":              anthropicReq.Model,
 					"model_version":      anthropicReq.Model,
