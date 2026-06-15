@@ -165,7 +165,7 @@ func main() {
 	}
 
 	app.Get("/", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
+		return c.Redirect("/dashboard", fiber.StatusTemporaryRedirect)
 	})
 
 	app.Get("/v1", func(c *fiber.Ctx) error {
