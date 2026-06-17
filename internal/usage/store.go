@@ -8,7 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -102,6 +104,21 @@ type TokenMix struct {
 	CacheReadTokens  int64 `json:"cache_read_tokens"`
 	CacheWriteTokens int64 `json:"cache_write_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+}
+
+type TTFTPercentiles struct {
+	P50 int64 `json:"p50"`
+	P95 int64 `json:"p95"`
+	P99 int64 `json:"p99"`
+}
+
+type TTFTGroup struct {
+	Name string `json:"name"`
+	Count int64 `json:"count"`
+	AvgMS int64 `json:"avg_ms"`
+	P50MS int64 `json:"p50_ms"`
+	P95MS int64 `json:"p95_ms"`
+	P99MS int64 `json:"p99_ms"`
 }
 
 type UsageDashboard struct {
@@ -307,6 +324,109 @@ func (s *Store) Record(ctx context.Context, r RequestLog) error {
 		r.User, r.APIKey, r.ClientIP, r.RouterDecision, r.FallbackCount, boolInt(r.HasImage),
 		truncate(r.RequestBody, 16000), truncate(r.ResponseBody, 16000))
 	return err
+}
+
+func ttftPercentileFromRows(rows *sql.Rows) (TTFTPercentiles, error) {
+	defer rows.Close()
+	var values []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			return TTFTPercentiles{}, err
+		}
+		if v > 0 {
+			values = append(values, v)
+		}
+	}
+	if len(values) == 0 {
+		return TTFTPercentiles{}, nil
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	return TTFTPercentiles{
+		P50: percentileSorted(values, 0.50),
+		P95: percentileSorted(values, 0.95),
+		P99: percentileSorted(values, 0.99),
+	}, nil
+}
+
+func percentileSorted(sorted []int64, p float64) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(math.Ceil(p*float64(len(sorted)+1)) - 1)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+// TTFTPercentiles computes p50/p95/p99 for non-zero TTFT values over the window.
+func (s *Store) TTFTPercentiles(ctx context.Context, hours int) (TTFTPercentiles, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	start := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	rows, err := s.db.QueryContext(ctx, `SELECT ttft_ms FROM request_logs WHERE created_at >= ? AND ttft_ms > 0`, start.Format(time.RFC3339Nano))
+	if err != nil {
+		return TTFTPercentiles{}, err
+	}
+	return ttftPercentileFromRows(rows)
+}
+
+// TTFTByGroup returns TTFT percentiles grouped by provider, model, or prompt_bucket.
+func (s *Store) TTFTByGroup(ctx context.Context, hours int, group string) ([]TTFTGroup, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	var col string
+	switch group {
+	case "provider":
+		col = "provider"
+	case "model":
+		col = "model"
+	case "prompt_bucket", "bucket":
+		col = "prompt_bucket"
+	default:
+		return nil, fmt.Errorf("unsupported group: %s", group)
+	}
+	start := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT %s, COUNT(*), COALESCE(AVG(ttft_ms),0) FROM request_logs WHERE created_at >= ? AND ttft_ms > 0 GROUP BY %s ORDER BY COUNT(*) DESC`, col, col), start.Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []TTFTGroup
+	for rows.Next() {
+		var name string
+		var count int64
+		var avg float64
+		if err := rows.Scan(&name, &count, &avg); err != nil {
+			return nil, err
+		}
+		groups = append(groups, TTFTGroup{Name: name, Count: count, AvgMS: int64(avg)})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	for i := range groups {
+		valueRows, err := s.db.QueryContext(ctx, fmt.Sprintf(`SELECT ttft_ms FROM request_logs WHERE created_at >= ? AND ttft_ms > 0 AND %s = ?`, col), start.Format(time.RFC3339Nano), groups[i].Name)
+		if err != nil {
+			return nil, err
+		}
+		p, err := ttftPercentileFromRows(valueRows)
+		if err != nil {
+			return nil, err
+		}
+		groups[i].P50MS = p.P50
+		groups[i].P95MS = p.P95
+		groups[i].P99MS = p.P99
+	}
+	return groups, nil
 }
 
 func (s *Store) Summary(ctx context.Context, hours int) (Summary, error) {

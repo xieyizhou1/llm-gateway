@@ -289,6 +289,46 @@ func TestForwarder_NormalizeHTTPImageURL(t *testing.T) {
 	}
 }
 
+func TestForwarder_Warmup(t *testing.T) {
+	var gotAuth string
+	var path string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		path = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer upstream.Close()
+
+	r := &router.Router{}
+	r.SetPoolForTest("kimi", router.NewKeyPool("kimi", config.ProviderConfig{
+		BaseURL: upstream.URL,
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "sk-warmup", Weight: 1, RPMLimit: 60},
+		},
+	}))
+	r.SetModelMapForTest("kimi", config.ProviderConfig{
+		BaseURL: upstream.URL,
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "sk-warmup", Weight: 1, RPMLimit: 60},
+		},
+		ModelMap: map[string]string{"gpt-4o": "deepseek-chat"},
+	})
+
+	fwd := NewForwarder(r, 10*time.Second, 0)
+	defer fwd.Close()
+
+	fwd.Warmup(context.Background())
+
+	if path != "/models" {
+		t.Errorf("warmup path: got %q, want /models", path)
+	}
+	if gotAuth != "Bearer sk-warmup" {
+		t.Errorf("warmup auth: got %q, want Bearer sk-warmup", gotAuth)
+	}
+}
+
 func TestForwarder_StreamResponse(t *testing.T) {
 	src := io.NopCloser(strings.NewReader("Hello, World!"))
 

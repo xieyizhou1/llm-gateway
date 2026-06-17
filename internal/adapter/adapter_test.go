@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -121,8 +122,8 @@ func TestAnthropicToOpenAIWithToolsAndToolBlocks(t *testing.T) {
 	if openAIReq.Messages[1].Role != "assistant" {
 		t.Fatalf("expected assistant tool call message, got %+v", openAIReq.Messages[1])
 	}
-	if strings.TrimSpace(openAIReq.Messages[1].ReasoningContent) == "" {
-		t.Fatalf("expected assistant tool call reasoning_content to be preserved")
+	if openAIReq.Messages[1].ReasoningContent != "" {
+		t.Fatalf("expected assistant tool call reasoning_content to be dropped, got %q", openAIReq.Messages[1].ReasoningContent)
 	}
 	if len(openAIReq.Messages[1].ToolCalls) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(openAIReq.Messages[1].ToolCalls))
@@ -743,8 +744,8 @@ func TestResponsesToOpenAIToolRoundTripItems(t *testing.T) {
 	if callMsg.Role != "assistant" || len(callMsg.ToolCalls) != 1 {
 		t.Fatalf("expected assistant tool call message, got %+v", callMsg)
 	}
-	if strings.TrimSpace(callMsg.ReasoningContent) == "" {
-		t.Fatalf("expected assistant tool call reasoning_content to be populated")
+	if callMsg.ReasoningContent != "" {
+		t.Fatalf("expected assistant tool call reasoning_content to be dropped, got %q", callMsg.ReasoningContent)
 	}
 	if callMsg.ToolCalls[0].ID != "call_123" || callMsg.ToolCalls[0].Function.Name != "exec_command" {
 		t.Fatalf("unexpected tool call: %+v", callMsg.ToolCalls[0])
@@ -1063,6 +1064,33 @@ func TestCompatibilityMatrixResponsesToolCallAndUsageStream(t *testing.T) {
 	}
 }
 
+func TestCompatibilityMatrixResponsesStreamCacheUsage(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chatcmpl-cache","object":"chat.completion.chunk","created":1,"model":"kimi-claude","choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+		`data: {"id":"chatcmpl-cache","object":"chat.completion.chunk","created":1,"model":"kimi-claude","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11000,"completion_tokens":1,"total_tokens":11001,"prompt_cache_hit_tokens":10880,"prompt_cache_miss_tokens":120}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+
+	var out bytes.Buffer
+	var gotUsage models.OpenAIUsage
+	err := OpenAIStreamToResponsesSSEWithUsage(io.NopCloser(strings.NewReader(stream)), &out, func(u models.OpenAIUsage) {
+		gotUsage = u
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotUsage.PromptCacheHitTokens != 10880 {
+		t.Fatalf("expected prompt_cache_hit_tokens 10880, got %d", gotUsage.PromptCacheHitTokens)
+	}
+	if gotUsage.PromptCacheMissTokens != 120 {
+		t.Fatalf("expected prompt_cache_miss_tokens 120, got %d", gotUsage.PromptCacheMissTokens)
+	}
+	if !strings.Contains(out.String(), "response.completed") {
+		t.Fatalf("expected completed event, got:\n%s", out.String())
+	}
+}
+
 func TestCompatibilityMatrixAnthropicThinkingToolUseAndResult(t *testing.T) {
 	req := &models.AnthropicMessageRequest{
 		Model: "gpt-5.5",
@@ -1130,8 +1158,8 @@ func TestAnthropicToOpenAICompactsHistoricalReasoning(t *testing.T) {
 		Messages: messages,
 	})
 
-	if got := openAIReq.Messages[0].ReasoningContent; got != reasoningPlaceholder {
-		t.Fatalf("old reasoning should be compacted, got %q", got)
+	if got := openAIReq.Messages[0].ReasoningContent; got != "" {
+		t.Fatalf("old reasoning should be dropped, got %q", got)
 	}
 	if got := len(openAIReq.Messages[4].ReasoningContent); got != maxRecentReasoningChars {
 		t.Fatalf("recent reasoning should be truncated to %d chars, got %d", maxRecentReasoningChars, got)
@@ -1308,5 +1336,170 @@ func TestAnthropicToOpenAISelectsEditTools(t *testing.T) {
 	}
 	if names["Bash"] || names["WebFetch"] {
 		t.Fatalf("unexpected tools selected: %+v", names)
+	}
+}
+
+
+func TestAnthropicToOpenAIWithImageBlock(t *testing.T) {
+	anthropicReq := models.AnthropicMessageRequest{
+		Model: "claude-sonnet-4-6",
+		Messages: []models.AnthropicMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{"type": "text", "text": "What color is the square?"},
+					map[string]interface{}{
+						"type": "image",
+						"source": map[string]interface{}{
+							"type":        "base64",
+							"media_type":  "image/png",
+							"data":        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+						},
+					},
+				},
+			},
+		},
+	}
+	openAIReq := AnthropicToOpenAI(&anthropicReq)
+	if len(openAIReq.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(openAIReq.Messages))
+	}
+	msg := openAIReq.Messages[0]
+	if msg.Role != "user" {
+		t.Fatalf("expected user role, got %s", msg.Role)
+	}
+	if len(msg.RawContent) == 0 {
+		t.Fatalf("expected RawContent with image_url part, got empty")
+	}
+	var parts []map[string]interface{}
+	if err := json.Unmarshal(msg.RawContent, &parts); err != nil {
+		t.Fatalf("failed to unmarshal RawContent: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 content parts, got %d", len(parts))
+	}
+	if parts[0]["type"] != "text" {
+		t.Fatalf("expected first part text, got %v", parts[0]["type"])
+	}
+	if parts[1]["type"] != "image_url" {
+		t.Fatalf("expected second part image_url, got %v", parts[1]["type"])
+	}
+	imageURL, ok := parts[1]["image_url"].(map[string]interface{})["url"].(string)
+	if !ok || !strings.HasPrefix(imageURL, "data:image/png;base64,") {
+		t.Fatalf("unexpected image_url: %v", imageURL)
+	}
+}
+
+func TestCompactReasoningForUpstreamKeepsMostRecentRealReasoning(t *testing.T) {
+	messages := []models.OpenAIMessage{
+		{Role: "assistant", Content: "first", ReasoningContent: "first reasoning"},
+		{Role: "user", Content: "ok"},
+		{Role: "assistant", Content: "second", ReasoningContent: "second reasoning"},
+	}
+
+	compactReasoningForUpstream(messages)
+
+	if messages[0].ReasoningContent != "" {
+		t.Errorf("expected historical reasoning cleared, got %q", messages[0].ReasoningContent)
+	}
+	if messages[2].ReasoningContent != "second reasoning" {
+		t.Errorf("expected most recent reasoning preserved, got %q", messages[2].ReasoningContent)
+	}
+}
+
+func TestCompactReasoningForUpstreamClearsPlaceholderReasoning(t *testing.T) {
+	messages := []models.OpenAIMessage{
+		{Role: "assistant", Content: "answer", ReasoningContent: reasoningPlaceholder},
+	}
+
+	compactReasoningForUpstream(messages)
+
+	if messages[0].ReasoningContent != "" {
+		t.Errorf("expected placeholder reasoning cleared, got %q", messages[0].ReasoningContent)
+	}
+}
+
+func TestCompactReasoningForUpstreamPreservesRecentToolCallReasoning(t *testing.T) {
+	messages := []models.OpenAIMessage{
+		{Role: "assistant", Content: "", ReasoningContent: "old tool reasoning", ToolCalls: []models.ToolCall{{ID: "call_1", Type: "function", Function: models.FunctionCall{Name: "bash", Arguments: "{}"}}}},
+		{Role: "tool", Content: "done", ToolCallID: "call_1"},
+		{Role: "assistant", Content: "final", ReasoningContent: "final reasoning"},
+	}
+
+	compactReasoningForUpstream(messages)
+
+	if messages[0].ReasoningContent != "" {
+		t.Errorf("expected old tool-call reasoning cleared, got %q", messages[0].ReasoningContent)
+	}
+	if messages[2].ReasoningContent != "final reasoning" {
+		t.Errorf("expected final reasoning preserved, got %q", messages[2].ReasoningContent)
+	}
+}
+
+func TestEnsureAssistantToolCallReasoningClearsPlaceholder(t *testing.T) {
+	messages := []models.OpenAIMessage{
+		{Role: "assistant", ReasoningContent: reasoningPlaceholder, ToolCalls: []models.ToolCall{{ID: "call_1", Type: "function", Function: models.FunctionCall{Name: "bash", Arguments: "{}"}}}},
+	}
+
+	EnsureAssistantToolCallReasoning(messages)
+
+	if messages[0].ReasoningContent != "" {
+		t.Errorf("expected placeholder reasoning cleared for tool-call message, got %q", messages[0].ReasoningContent)
+	}
+}
+
+func TestEnsureAssistantToolCallReasoningPreservesRealReasoning(t *testing.T) {
+	messages := []models.OpenAIMessage{
+		{Role: "assistant", ReasoningContent: "real tool reasoning", ToolCalls: []models.ToolCall{{ID: "call_1", Type: "function", Function: models.FunctionCall{Name: "bash", Arguments: "{}"}}}},
+	}
+
+	EnsureAssistantToolCallReasoning(messages)
+
+	if messages[0].ReasoningContent != "real tool reasoning" {
+		t.Errorf("expected real reasoning preserved for tool-call message, got %q", messages[0].ReasoningContent)
+	}
+}
+
+func TestEnsureAssistantToolCallReasoningRoundTripReplayedPlaceholder(t *testing.T) {
+	// Simulates WorkBuddy replaying the placeholder we previously emitted in a response.
+	messages := []models.OpenAIMessage{
+		{Role: "assistant", ReasoningContent: "plan", Content: "I'll check."},
+		{Role: "assistant", ReasoningContent: reasoningPlaceholder, ToolCalls: []models.ToolCall{{ID: "call_1", Type: "function", Function: models.FunctionCall{Name: "bash", Arguments: "{}"}}}},
+		{Role: "tool", Content: "done", ToolCallID: "call_1"},
+	}
+
+	EnsureAssistantToolCallReasoning(messages)
+	compactReasoningForUpstream(messages)
+
+	// The only real reasoning in this history is the first assistant turn, so it
+	// is kept as the most recent real reasoning. The replayed placeholder is
+	// cleared so Kimi does not echo it.
+	if messages[0].ReasoningContent != "plan" {
+		t.Errorf("expected only real reasoning to be kept, got %q", messages[0].ReasoningContent)
+	}
+	if messages[1].ReasoningContent != "" {
+		t.Errorf("expected replayed placeholder cleared for tool-call message, got %q", messages[1].ReasoningContent)
+	}
+}
+
+func TestRewriteOpenAIStreamBodyWithReasoningPreservesRealReasoning(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"real tool reasoning","tool_calls":[{"index":0,"id":"call_123","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+
+	var out bytes.Buffer
+	err := RewriteOpenAIStreamBodyWithReasoning(io.NopCloser(strings.NewReader(stream)), &out, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "real tool reasoning") {
+		t.Fatalf("expected real reasoning to be preserved in stream, got:\n%s", got)
+	}
+	if strings.Contains(got, reasoningPlaceholder) {
+		t.Fatalf("expected placeholder not to replace real reasoning, got:\n%s", got)
 	}
 }

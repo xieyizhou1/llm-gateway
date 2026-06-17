@@ -187,9 +187,64 @@ func logSampledRequestShapes(logger *mw.Logger, traceID string, record *usage.Re
 	})
 }
 
-func markTTFT(record *usage.RequestLog, start time.Time) {
-	if record == nil || !record.Stream || record.TTFTMS != 0 || start.IsZero() {
+func markTTFT(record *usage.RequestLog, start time.Time, branch string) {
+	reason := ""
+	entered := true
+	switch {
+	case record == nil:
+		reason = "record_nil"
+		entered = false
+	case !record.Stream:
+		reason = "not_stream"
+		entered = false
+	case record.TTFTMS != 0:
+		reason = "already_set"
+		entered = false
+	case start.IsZero():
+		reason = "start_zero"
+		entered = false
+	}
+	traceID := ""
+	provider := ""
+	model := ""
+	stream := false
+	if record != nil {
+		traceID = record.TraceID
+		provider = record.Provider
+		model = record.Model
+		stream = record.Stream
+	}
+	if !entered {
+		mw.NewLogger("INFO").Log(mw.LogEntry{
+			Level:   "INFO",
+			TraceID: traceID,
+			Module:  "ttft",
+			Event:   "mark_skipped",
+			Data: map[string]interface{}{
+				"trace_id": traceID,
+				"provider": provider,
+				"model":    model,
+				"stream":   stream,
+				"branch":   branch,
+				"reason":   reason,
+				"ttft_ms":  0,
+			},
+		})
 		return
 	}
 	record.TTFTMS = time.Since(start).Milliseconds()
+	mw.NewLogger("INFO").Log(mw.LogEntry{
+		Level:   "INFO",
+		TraceID: traceID,
+		Module:  "ttft",
+		Event:   "mark_set",
+		Data: map[string]interface{}{
+			"trace_id": traceID,
+			"provider": provider,
+			"model":    model,
+			"stream":   stream,
+			"branch":   branch,
+			"ttft_ms":  record.TTFTMS,
+		},
+	})
 }

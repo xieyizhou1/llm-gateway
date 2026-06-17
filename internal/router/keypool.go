@@ -4,6 +4,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,7 @@ type ProviderKey struct {
 	State       KeyState
 	CooldownEnd time.Time
 	FailCount   int32
+	LastSeenAt  time.Time
 }
 
 // KeyPool 管理单个 Provider 的 Key 池，支持原子轮询和健康检查。
@@ -151,6 +153,49 @@ func (p *KeyPool) ResetFailure(keyID string) {
 	}
 }
 
+// MarkSuccess records a successful upstream response. It clears any failure
+// count and recovers a cooldown key, but leaves manually disabled keys alone.
+func (p *KeyPool) MarkSuccess(keyID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, k := range p.keys {
+		if k.ID == keyID {
+			atomic.StoreInt32(&k.FailCount, 0)
+			k.LastSeenAt = time.Now()
+			if k.State == KeyStateCooldown {
+				k.State = KeyStateHealthy
+				k.CooldownEnd = time.Time{}
+			}
+			break
+		}
+	}
+}
+
+// MarkHeartbeat records a key as seen by the heartbeat probe.
+func (p *KeyPool) MarkHeartbeat(keyID string, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, k := range p.keys {
+		if k.ID == keyID {
+			k.LastSeenAt = time.Now()
+			if !ok {
+				count := atomic.AddInt32(&k.FailCount, 1)
+				if count >= 3 && k.State != KeyStateDisabled {
+					k.State = KeyStateCooldown
+					k.CooldownEnd = time.Now().Add(60 * time.Second)
+				}
+			} else {
+				atomic.StoreInt32(&k.FailCount, 0)
+				if k.State == KeyStateCooldown {
+					k.State = KeyStateHealthy
+					k.CooldownEnd = time.Time{}
+				}
+			}
+			break
+		}
+	}
+}
+
 // MarkHealthy enables a key and clears any cooldown/failure state.
 func (p *KeyPool) MarkHealthy(keyID string) {
 	p.mu.Lock()
@@ -234,12 +279,13 @@ func (r *RateLimiter) Allow(ctx context.Context, key string, limit int) (bool, e
 
 // Router 负责选择 Provider 和 Key，并执行限流检查。
 type Router struct {
-	pools         map[string]*KeyPool
-	limiter       *RateLimiter
-	strategy      string
-	providerOrder []string
-	modelMap      map[string]config.ProviderConfig
-	capabilities  map[string]config.ModelCapability
+	pools           map[string]*KeyPool
+	limiter         *RateLimiter
+	strategy        string
+	providerOrder   []string
+	modelMap        map[string]config.ProviderConfig
+	capabilities    map[string]config.ModelCapability
+	cooldownSeconds int
 }
 
 // NewRouter 创建 Router 实例。
@@ -258,12 +304,13 @@ func NewRouter(cfg *config.Config, redisClient *redis.Client) *Router {
 	}
 
 	return &Router{
-		pools:         pools,
-		limiter:       limiter,
-		strategy:      cfg.Router.Strategy,
-		providerOrder: cfg.Router.ProviderOrder,
-		modelMap:      modelMap,
-		capabilities:  cfg.ModelCapabilities,
+		pools:           pools,
+		limiter:         limiter,
+		strategy:        cfg.Router.Strategy,
+		providerOrder:   cfg.Router.ProviderOrder,
+		modelMap:        modelMap,
+		capabilities:    cfg.ModelCapabilities,
+		cooldownSeconds: cfg.Router.CooldownSeconds,
 	}
 }
 
@@ -288,13 +335,45 @@ func (r *Router) SetModelMapForTest(provider string, cfg config.ProviderConfig) 
 	r.modelMap[provider] = cfg
 }
 
+// ProviderEndpoint describes an upstream provider endpoint for connection warmup.
+type ProviderEndpoint struct {
+	Provider string
+	BaseURL  string
+	Headers  map[string]string
+	Keys     []config.ProviderKey
+}
+
+// ProviderEndpoints returns all configured provider endpoints.
+func (r *Router) ProviderEndpoints() []ProviderEndpoint {
+	result := make([]ProviderEndpoint, 0, len(r.modelMap))
+	for name, cfg := range r.modelMap {
+		result = append(result, ProviderEndpoint{
+			Provider: name,
+			BaseURL:  cfg.BaseURL,
+			Headers:  cfg.Headers,
+			Keys:     cfg.Keys,
+		})
+	}
+	return result
+}
+
+// Capability returns the configured capability profile for a client-facing model alias.
+func (r *Router) Capability(model string) (config.ModelCapability, bool) {
+	if r == nil {
+		return config.ModelCapability{}, false
+	}
+	cap, ok := r.capabilities[model]
+	return cap, ok
+}
+
 // ProviderKeyStatus is a display-safe snapshot of a provider key.
 type ProviderKeyStatus struct {
-	Provider    string `json:"provider"`
-	ID          string `json:"id"`
-	State       string `json:"state"`
-	CooldownEnd string `json:"cooldown_end,omitempty"`
-	FailCount   int32  `json:"fail_count"`
+	Provider    string    `json:"provider"`
+	ID          string    `json:"id"`
+	State       string    `json:"state"`
+	CooldownEnd string    `json:"cooldown_end,omitempty"`
+	FailCount   int32     `json:"fail_count"`
+	LastSeenAt  time.Time `json:"last_seen_at,omitempty"`
 }
 
 // RouteResult 包含路由选择的结果。
@@ -369,10 +448,10 @@ func (r *Router) priorityProvidersForModel(model string) []string {
 	if model == "" {
 		return nil
 	}
-	ordered := make([]string, 0, len(r.pools))
 	seen := make(map[string]bool, len(r.pools))
-	for providerName, cfg := range r.modelMap {
-		if cfg.ModelMap == nil {
+	for _, providerName := range r.providerOrder {
+		cfg, ok := r.modelMap[providerName]
+		if !ok || cfg.ModelMap == nil {
 			continue
 		}
 		if upstream, ok := cfg.ModelMap[model]; !ok || upstream == "" {
@@ -382,12 +461,21 @@ func (r *Router) priorityProvidersForModel(model string) []string {
 			continue
 		}
 		seen[providerName] = true
-		ordered = append(ordered, providerName)
+	}
+	ordered := make([]string, 0, len(seen))
+	for _, providerName := range r.providerOrder {
+		if seen[providerName] {
+			ordered = append(ordered, providerName)
+			delete(seen, providerName)
+		}
 	}
 	return ordered
 }
 
 func (r *Router) providerSupportsImages(cfg config.ProviderConfig, model string) bool {
+	if !cfg.SupportsImages {
+		return false
+	}
 	mapped, ok := cfg.ModelMap[model]
 	if !ok || mapped == "" {
 		return false
@@ -407,14 +495,16 @@ func (r *Router) MarkKeyResult(provider, keyID string, statusCode int) {
 	}
 
 	switch {
-	case statusCode == 429:
-		pool.MarkCooldown(keyID, 60*time.Second)
-	case statusCode == 401:
+	case statusCode == http.StatusUnauthorized:
 		pool.MarkDisabled(keyID)
+	case statusCode == http.StatusTooManyRequests:
+		pool.MarkCooldown(keyID, time.Duration(r.cooldownSeconds)*time.Second)
+	case statusCode == http.StatusServiceUnavailable:
+		pool.MarkHeartbeat(keyID, false)
 	case statusCode >= 500:
 		pool.MarkFailure(keyID)
 	default:
-		pool.ResetFailure(keyID)
+		pool.MarkSuccess(keyID)
 	}
 }
 
@@ -433,10 +523,11 @@ func (r *Router) AllKeyStatuses() []ProviderKeyStatus {
 	for provider, pool := range r.pools {
 		for _, key := range pool.AllKeys() {
 			item := ProviderKeyStatus{
-				Provider:  provider,
-				ID:        key.ID,
-				State:     key.State.String(),
-				FailCount: key.FailCount,
+				Provider:   provider,
+				ID:         key.ID,
+				State:      key.State.String(),
+				FailCount:  key.FailCount,
+				LastSeenAt: key.LastSeenAt,
 			}
 			if !key.CooldownEnd.IsZero() {
 				item.CooldownEnd = key.CooldownEnd.Format(time.RFC3339Nano)

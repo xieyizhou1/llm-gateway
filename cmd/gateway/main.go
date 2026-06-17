@@ -104,6 +104,7 @@ func setupGateway(cfgPath string, logLevel string) (*GatewayDeps, error) {
 	}
 	r := router.NewRouter(cfg, redisClient)
 	fwd := forwarder.NewForwarder(r, time.Duration(cfg.Router.TimeoutSeconds)*time.Second, cfg.Router.RetryCount)
+	fwd.SetLogger(logger)
 
 	return &GatewayDeps{
 		logger:      logger,
@@ -140,6 +141,21 @@ func main() {
 	r := deps.router
 	fwd := deps.forwarder
 	usageStore := deps.usageStore
+
+	// 预先与上游建立 TCP/TLS 连接，降低首个大 prompt 请求的 TTFT。
+	// 使用独立短超时，预热失败不阻断启动。
+	{
+		warmupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		fwd.Warmup(warmupCtx)
+		cancel()
+	}
+
+	// 启动后台心跳：每 30 秒对每个 provider key 探测 /models，更新真实可通状态。
+	{
+		heartbeatCtx, cancel := context.WithCancel(context.Background())
+		fwd.StartHeartbeat(heartbeatCtx, 30*time.Second)
+		defer cancel()
+	}
 
 	// Fiber
 	app := fiber.New(fiber.Config{
@@ -238,7 +254,7 @@ func main() {
 func handleOpenAIChatCompletions(fwd *forwarder.Forwarder, logger *mw.Logger, r *router.Router, usageStore *usage.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		traceID := mw.ExtractTraceID(c)
-		ctx := c.Context()
+		ctx := forwarder.WithTraceID(c.Context(), traceID)
 		start := time.Now()
 		record := newUsageRecord(c, "openai_chat")
 		defer func() {
@@ -254,7 +270,11 @@ func handleOpenAIChatCompletions(fwd *forwarder.Forwarder, logger *mw.Logger, r 
 			record.ErrorMessage = err.Error()
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 		}
+		adapter.NormalizeOpenAIRequest(&req)
 		adapter.EnsureAssistantToolCallReasoning(req.Messages)
+		if cap, ok := r.Capability(req.Model); ok && cap.SupportsCache {
+			adapter.InjectPromptCacheControl(&req, true)
+		}
 		record.Model = req.Model
 		record.Stream = req.Stream
 		record.HasImage = req.HasImageContent()
@@ -323,14 +343,18 @@ func handleOpenAIChatCompletions(fwd *forwarder.Forwarder, logger *mw.Logger, r 
 			err = adapter.RewriteOpenAIStreamBodyWithReasoning(reader, &ttftMarkWriter{
 				w: writer,
 				mark: func() {
-					markTTFT(record, start)
+					markTTFT(record, start, "openai_chat_stream_writer")
 				},
 			}, func(finishReason string) {
 				record.FinishReason = finishReason
-			}, func(usage *models.OpenAIUsage) {
-				record.PromptTokens = usage.PromptTokens
-				record.OutputTokens = usage.CompletionTokens
-				record.TotalTokens = usage.TotalTokens
+			}, func(u *models.OpenAIUsage) {
+				record.PromptTokens = u.PromptTokens
+				record.OutputTokens = u.CompletionTokens
+				record.TotalTokens = u.TotalTokens
+				cacheUsage := usage.CacheUsageFromOpenAIUsage(*u)
+				record.CacheReadTokens = cacheUsage.CacheReadTokens
+				record.CacheWriteTokens = cacheUsage.CacheWriteTokens
+				record.CacheHitRate = cacheUsage.CacheHitRate
 			})
 			record.ResponseBody = capture.String()
 			if err != nil {
@@ -459,7 +483,7 @@ func peekUpstreamStreamError(r io.Reader) (io.Reader, []byte, error) {
 func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *router.Router, usageStore *usage.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		traceID := mw.ExtractTraceID(c)
-		ctx := c.Context()
+		ctx := forwarder.WithTraceID(c.Context(), traceID)
 		start := time.Now()
 		record := newUsageRecord(c, "anthropic_messages")
 		defer func() {
@@ -508,86 +532,11 @@ func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *rou
 		// 转换为 OpenAI 请求
 		openAIReq := adapter.AnthropicToOpenAI(&anthropicReq)
 		record.HasImage = openAIReq.HasImageContent()
+		if cap, ok := r.Capability(openAIReq.Model); ok && cap.SupportsCache {
+			adapter.InjectPromptCacheControl(openAIReq, true)
+		}
 
 		if anthropicReq.Stream {
-			if len(anthropicReq.Tools) > 0 {
-				openAIReq.Stream = false
-				result, err := fwd.ForwardOpenAIRequestWithInfo(ctx, openAIReq)
-				if err != nil {
-					logger.Error(traceID, "forwarder", "forward_anthropic_tool_stream", err, nil)
-					record.ErrorCode = "gateway_error"
-					record.ErrorMessage = err.Error()
-					finishUsageRecord(c, usageStore, start, record)
-					return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "service temporarily unavailable"})
-				}
-				resp := result.Response
-				applyForwardInfo(record, result.Info)
-				defer resp.Body.Close()
-
-				rawBody, err := io.ReadAll(resp.Body)
-				if err != nil {
-					logger.Error(traceID, "handler", "read_anthropic_tool_stream_response", err, nil)
-					record.ErrorCode = "read_error"
-					record.ErrorMessage = err.Error()
-					finishUsageRecord(c, usageStore, start, record)
-					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "read response failed"})
-				}
-				record.ResponseBody = truncateBody(string(rawBody))
-
-				// 检查上游 200 响应是否实际是 JSON 错误（某些 Provider 会这样做）
-				trimmed := strings.TrimSpace(string(rawBody))
-				if strings.HasPrefix(trimmed, "{\"error\"") || strings.HasPrefix(trimmed, "{\"type\"") {
-					logger.Error(traceID, "handler", "upstream_tool_stream_error", fmt.Errorf("upstream returned 200 with error body"), map[string]interface{}{
-						"provider": result.Info.Provider,
-						"key_id":   result.Info.ProviderKeyID,
-					})
-					r.MarkKeyResult(result.Info.Provider, result.Info.ProviderKeyID, http.StatusTooManyRequests)
-					record.ErrorCode = "upstream_error"
-					record.ErrorMessage = string(rawBody)
-					finishUsageRecord(c, usageStore, start, record)
-					return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "upstream rate limit or quota exceeded"})
-				}
-
-				openAIResp, cacheUsage, err := decodeOpenAIResponseAndCache(rawBody)
-				if err != nil {
-					logger.Error(traceID, "handler", "decode_anthropic_tool_stream_response", err, nil)
-					record.ErrorCode = "decode_error"
-					record.ErrorMessage = err.Error()
-					finishUsageRecord(c, usageStore, start, record)
-					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "decode response failed"})
-				}
-
-				anthropicResp := adapter.OpenAIToAnthropic(&openAIResp)
-				outputHash := hashAnthropicResponseContent(anthropicResp)
-				record.PromptTokens = anthropicResp.Usage.InputTokens
-				record.OutputTokens = anthropicResp.Usage.OutputTokens
-				record.TotalTokens = anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens
-				record.CacheReadTokens = cacheUsage.CacheReadTokens
-				record.CacheWriteTokens = cacheUsage.CacheWriteTokens
-				record.CacheHitRate = cacheUsage.CacheHitRate
-				record.OutputHash = outputHash
-				record.FinishReason = anthropicResp.StopReason
-				logger.Audit(traceID, "llm_call", map[string]interface{}{
-					"model":              anthropicReq.Model,
-					"model_version":      anthropicReq.Model,
-					"prompt_version":     "",
-					"input_tokens":       anthropicResp.Usage.InputTokens,
-					"output_tokens":      anthropicResp.Usage.OutputTokens,
-					"cache_read_tokens":  cacheUsage.CacheReadTokens,
-					"cache_write_tokens": cacheUsage.CacheWriteTokens,
-					"cache_hit_rate":     cacheUsage.CacheHitRate,
-					"input_hash":         hashAnthropicMessages(anthropicReq.Messages, anthropicReq.System),
-					"output_hash":        outputHash,
-				})
-
-				c.Set("Content-Type", "text/event-stream")
-				c.Set("Cache-Control", "no-cache")
-				c.Set("Connection", "keep-alive")
-				writeAnthropicResponseSSE(c.Context().Response.BodyWriter(), anthropicResp)
-				finishUsageRecord(c, usageStore, start, record)
-				return nil
-			}
-
 			result, err := fwd.ForwardOpenAIRequestWithInfo(ctx, openAIReq)
 			if err != nil {
 				logger.Error(traceID, "forwarder", "forward_anthropic_stream", err, nil)
@@ -623,7 +572,7 @@ func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *rou
 			bodyWriter := &ttftMarkWriter{
 				w: c.Context().Response.BodyWriter(),
 				mark: func() {
-					markTTFT(record, start)
+					markTTFT(record, start, "anthropic_messages_stream_writer")
 				},
 			}
 
@@ -638,7 +587,7 @@ func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *rou
 				if n > 0 {
 					if firstByte {
 						firstByte = false
-						markTTFT(record, start)
+						markTTFT(record, start, "anthropic_messages_stream_first_byte")
 					}
 					pending = append(pending, buf[:n]...)
 					for {
@@ -663,6 +612,10 @@ func handleAnthropicMessages(fwd *forwarder.Forwarder, logger *mw.Logger, r *rou
 									record.PromptTokens = chunk.Usage.PromptTokens
 									record.OutputTokens = chunk.Usage.CompletionTokens
 									record.TotalTokens = chunk.Usage.TotalTokens
+									cacheUsage := usage.CacheUsageFromOpenAIUsage(*chunk.Usage)
+									record.CacheReadTokens = cacheUsage.CacheReadTokens
+									record.CacheWriteTokens = cacheUsage.CacheWriteTokens
+									record.CacheHitRate = cacheUsage.CacheHitRate
 								}
 								streamState.start(bodyWriter, &chunk, anthropicReq)
 								for _, choice := range chunk.Choices {
@@ -1111,7 +1064,7 @@ func findDoubleNewline(data []byte) int {
 func handleResponses(fwd *forwarder.Forwarder, logger *mw.Logger, r *router.Router, usageStore *usage.Store) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		traceID := mw.ExtractTraceID(c)
-		ctx := c.Context()
+		ctx := forwarder.WithTraceID(c.Context(), traceID)
 		start := time.Now()
 		record := newUsageRecord(c, "responses")
 		defer finishUsageRecord(c, usageStore, start, record)
@@ -1211,12 +1164,16 @@ func handleResponses(fwd *forwarder.Forwarder, logger *mw.Logger, r *router.Rout
 				adapter.OpenAIStreamToResponsesSSEWithUsage(reader, &ttftMarkWriter{
 					w: w,
 					mark: func() {
-						markTTFT(record, start)
+						markTTFT(record, start, "responses_stream_writer")
 					},
-				}, func(usage models.OpenAIUsage) {
-					record.PromptTokens = usage.PromptTokens
-					record.OutputTokens = usage.CompletionTokens
-					record.TotalTokens = usage.TotalTokens
+				}, func(u models.OpenAIUsage) {
+					record.PromptTokens = u.PromptTokens
+					record.OutputTokens = u.CompletionTokens
+					record.TotalTokens = u.TotalTokens
+					cacheUsage := usage.CacheUsageFromOpenAIUsage(u)
+					record.CacheReadTokens = cacheUsage.CacheReadTokens
+					record.CacheWriteTokens = cacheUsage.CacheWriteTokens
+					record.CacheHitRate = cacheUsage.CacheHitRate
 				})
 				w.Flush()
 				finishUsageRecordWithStatus(usageStore, start, record, fiber.StatusOK)
@@ -1374,8 +1331,26 @@ func finishUsageRecordWithStatus(store *usage.Store, start time.Time, record *us
 	if record.TTFTMS == 0 && !record.Stream && record.StatusCode < fiber.StatusBadRequest {
 		record.TTFTMS = record.LatencyMS
 	}
+	mw.NewLogger("INFO").Log(mw.LogEntry{
+		Level:   "INFO",
+		TraceID: record.TraceID,
+		Module:  "ttft",
+		Event:   "finish_record",
+		Data: map[string]interface{}{
+			"trace_id":   record.TraceID,
+			"provider":   record.Provider,
+			"model":      record.Model,
+			"stream":     record.Stream,
+			"status":     status,
+			"latency_ms": record.LatencyMS,
+			"ttft_ms":    record.TTFTMS,
+		},
+	})
 	if record.TotalTokens == 0 {
 		record.TotalTokens = record.PromptTokens + record.OutputTokens
+	}
+	if record.CacheHitRate == 0 && record.CacheReadTokens > 0 && record.PromptTokens > 0 {
+		record.CacheHitRate = float64(record.CacheReadTokens) / float64(record.PromptTokens)
 	}
 	if record.ErrorCode == "" && status >= fiber.StatusBadRequest {
 		record.ErrorCode = defaultErrorCode(status)
@@ -1599,6 +1574,31 @@ func registerDashboard(app *fiber.App, cfg *config.Config, store *usage.Store, a
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 		}
 		return c.JSON(data)
+	})
+	api.Get("/ttft", func(c *fiber.Ctx) error {
+		hours, _ := strconv.Atoi(c.Query("hours", "24"))
+		overall, err := store.TTFTPercentiles(c.Context(), hours)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		byProvider, err := store.TTFTByGroup(c.Context(), hours, "provider")
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		byModel, err := store.TTFTByGroup(c.Context(), hours, "model")
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		byBucket, err := store.TTFTByGroup(c.Context(), hours, "prompt_bucket")
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"overall":     overall,
+			"by_provider": byProvider,
+			"by_model":    byModel,
+			"by_bucket":   byBucket,
+		})
 	})
 	api.Get("/requests", func(c *fiber.Ctx) error {
 		data, err := store.Requests(c.Context(), requestFilterFromQuery(c))
@@ -1899,7 +1899,7 @@ tbody tr.active{background:var(--surface-3)}
 .line-chart .dot{fill:var(--accent);r:3}
 .line-chart .axis{stroke:var(--border);stroke-width:1}
 .line-chart .grid{stroke:var(--border-2);stroke-width:1;stroke-dasharray:2,2}
-.line-chart .axis-label{font-size:10px;fill:var(--text-3)}
+.line-chart .axis-label{font-size:10px;fill:var(--text-3)}.chart-tooltip{position:fixed;pointer-events:none;background:rgba(0,0,0,.85);color:#fff;padding:8px 12px;border-radius:6px;font-size:12px;line-height:1.4;z-index:1000;opacity:0;transition:opacity .15s;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.15)}.chart-tooltip.visible{opacity:1}.chart-tooltip .label{color:#aaa;font-size:11px;margin-bottom:2px}.chart-tooltip .value{font-weight:600}.chart-bar-item,.line-chart .dot{cursor:pointer}
 
 /* ─── Drawers ─── */
 .drawer{position:fixed;inset:0 0 0 auto;width:min(520px,100vw);background:var(--surface);box-shadow:var(--shadow-lg);z-index:100;transform:translateX(100%);transition:transform .3s cubic-bezier(.16,1,.3,1);display:flex;flex-direction:column}
@@ -1969,7 +1969,7 @@ tbody tr.active{background:var(--surface-3)}
   .topbar{padding:0 16px}
   .filter-bar input,.filter-bar select{min-width:100px}
 }
-</style></head><body>
+</style></head><body><div id="chartTooltip" class="chart-tooltip"></div>
 
 <div class="app">
 <!-- Sidebar -->
@@ -2045,6 +2045,31 @@ tbody tr.active{background:var(--surface-3)}
       <!-- Core Metrics -->
       <div class="section-title">Core Metrics <span style="font-weight:400;color:var(--text-3)">· Last 24h</span></div>
       <div class="metric-grid" id="overviewMetrics"></div>
+
+      <!-- TTFT Analysis -->
+      <div class="section-title">TTFT Analysis <span style="font-weight:400;color:var(--text-3)">· Last 24h</span></div>
+      <div class="metric-grid" id="ttftMetrics"></div>
+      <div class="card" style="margin-bottom:24px">
+        <div class="card-head"><div class="card-title">TTFT by Provider</div></div>
+        <div class="card-body" style="padding:0">
+          <div class="data-grid-head" style="grid-template-columns:minmax(140px,1fr) 80px 80px 80px 80px 80px"><div>Provider</div><div>Count</div><div>Avg</div><div>p50</div><div>p95</div><div>p99</div></div>
+          <div id="ttftProviderRows"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:24px">
+        <div class="card-head"><div class="card-title">TTFT by Model</div></div>
+        <div class="card-body" style="padding:0">
+          <div class="data-grid-head" style="grid-template-columns:minmax(140px,1fr) 80px 80px 80px 80px 80px"><div>Model</div><div>Count</div><div>Avg</div><div>p50</div><div>p95</div><div>p99</div></div>
+          <div id="ttftModelRows"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:24px">
+        <div class="card-head"><div class="card-title">TTFT by Prompt Size</div></div>
+        <div class="card-body" style="padding:0">
+          <div class="data-grid-head" style="grid-template-columns:minmax(140px,1fr) 80px 80px 80px 80px 80px"><div>Bucket</div><div>Count</div><div>Avg</div><div>p50</div><div>p95</div><div>p99</div></div>
+          <div id="ttftBucketRows"></div>
+        </div>
+      </div>
 
       <!-- Provider Health -->
       <div class="section-title">Providers</div>
@@ -2179,7 +2204,7 @@ const token=new URLSearchParams(location.search).get('token')||localStorage.getI
 if(token)localStorage.setItem('llm_gateway_dashboard_token',token);
 const h=token?{'X-Dashboard-Token':token}:{};
 const el=id=>document.getElementById(id);
-let lastRows=[],currentPeriod='today';
+let lastRows=[],currentPeriod='today',lastUsage=null,lastErrors=null;
 
 function periodDays(){switch(currentPeriod){case'today':return 1;case'week':return 7;case'month':return 30;default:return 1}}
 function api(path){const u=new URL(path,location.origin);if(token)u.searchParams.set('token',token);return u.pathname+u.search}
@@ -2191,12 +2216,13 @@ function dt(x){return x?new Date(x).toLocaleString('en-US',{month:'short',day:'n
 function shortTrace(x){return x?String(x).slice(0,8):''}
 function pct(x){return x==null?'0%':(Math.round(num(x)*1000)/10)+'%'}
 function compact(n){n=num(n);if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(Math.round(n))}
+const tooltip={el:null,show(html,x,y){if(!this.el)this.el=document.getElementById('chartTooltip');this.el.innerHTML=html;this.el.classList.add('visible');this.move(x,y)},move(x,y){if(!this.el)return;const rect=this.el.getBoundingClientRect();let left=x+12,top=y-rect.height-12;if(left+rect.width>window.innerWidth)left=x-rect.width-12;if(top<0)top=y+12;this.el.style.left=left+'px';this.el.style.top=top+'px'},hide(){if(this.el)this.el.classList.remove('visible')}};
 function dateLabel(x){return x?new Date(x).toLocaleDateString('en-US',{month:'short',day:'numeric'}):''}
 function jsonHeaders(){return Object.assign({'Content-Type':'application/json'},h)}
 async function j(url,opt){const r=await fetch(url,opt||{headers:h});const text=await r.text();if(!r.ok)throw new Error(text||r.statusText);return text?JSON.parse(text):{}}
 
 // ─── Navigation ───
-function setView(name){document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===name));document.querySelectorAll('.nav-item').forEach(x=>x.classList.toggle('active',x.dataset.view===name));el('pageTitle').textContent=name.charAt(0).toUpperCase()+name.slice(1);el('exportBtn').style.display=name==='requests'?'inline-flex':'none'}
+function setView(name){document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===name));document.querySelectorAll('.nav-item').forEach(x=>x.classList.toggle('active',x.dataset.view===name));el('pageTitle').textContent=name.charAt(0).toUpperCase()+name.slice(1);el('exportBtn').style.display=name==='requests'?'inline-flex':'none';if(name==='usage'&&lastUsage){renderUsage(lastUsage)}if(name==='errors'&&lastErrors){renderErrors(lastErrors)}}
 document.querySelectorAll('.nav-item').forEach(n=>n.addEventListener('click',()=>setView(n.dataset.view)));
 
 // ─── Drawer ───
@@ -2206,12 +2232,12 @@ el('drawerClose').addEventListener('click',closeDrawer);el('drawerOverlay').addE
 
 // ─── Render Helpers ───
 function statusBadge(code){if(!code||code>=400)return'<span class="cell-badge badge-red">'+code+'</span>';if(code>=300)return'<span class="cell-badge badge-amber">'+code+'</span>';return'<span class="cell-badge badge-green">'+code+'</span>'}
-function stateBadge(state){const map={healthy:['badge-green','Healthy'],active:['badge-green','Active'],cooldown:['badge-amber','Cooldown'],disabled:['badge-red','Disabled'],revoked:['badge-red','Revoked']};const[m,l]=map[state]||['badge-gray',state];return'<span class="cell-badge '+m+'">'+(l||state)+'</span>'}
+function stateBadge(state){const map={healthy:['badge-green','Healthy'],active:['badge-green','Active'],disabled:['badge-red','Disabled'],revoked:['badge-red','Revoked']};const display=(state==='cooldown'?'healthy':state);const[m,l]=map[display]||['badge-gray',display];return'<span class="cell-badge '+m+'">'+(l||display)+'</span>'}
 function healthCard(icon,status,title,desc,meta){const cls=status==='ok'?'ok':status==='warn'?'warn':'bad';return'<div class="health-card"><div class="health-icon '+cls+'">'+icon+'</div><div class="health-content"><div class="health-title">'+title+'</div><div class="health-desc">'+desc+'</div><div class="health-meta">'+meta+'</div></div></div>'}
 function metricCard(label,value,hint,delta){return'<div class="metric-card"><div class="metric-label">'+label+'</div><div class="metric-value">'+value+'</div><div class="metric-hint">'+hint+(delta?'<span class="metric-delta '+delta.cls+'">'+delta.text+'</span>':'')+'</div></div>'}
 
 // ─── Overview ───
-function renderOverview(s,rows,keydata,errors,usageOverview){const avgCache=rows.length?rows.reduce((a,r)=>a+num(r.cache_hit_rate),0)/rows.length:0;const slow=rows.filter(r=>r.slow_reason||num(r.status_code)>=400).length;const errorRate=rows.length?Math.round(slow/rows.length*1000)/10:0;
+function renderOverview(s,rows,keydata,errors,usageOverview){const mix=(usageOverview&&usageOverview.token_mix)||{};const overallCache=num(mix.prompt_tokens)>0?num(mix.cache_read_tokens)/num(mix.prompt_tokens):0;const cacheMisses=num(mix.prompt_tokens)-num(mix.cache_read_tokens);const avgCache=rows.length?rows.reduce((a,r)=>a+num(r.cache_hit_rate),0)/rows.length:0;const slow=rows.filter(r=>r.slow_reason||num(r.status_code)>=400).length;const errorRate=rows.length?Math.round(slow/rows.length*1000)/10:0;
 
 // Health Cards
 const providers=(keydata.keys||[]).map(k=>k.provider).filter((v,i,a)=>a.indexOf(v)===i);
@@ -2222,7 +2248,7 @@ const exhaustedKeys=(keydata.keys||[]).filter(k=>k.state==='disabled').length;
 el('healthCards').innerHTML=
   healthCard('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>','ok','Gateway Online','All systems operational','Uptime · 99.9%')+
   healthCard('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',exhaustedKeys>0?'warn':'ok','Providers',''+providers.join(', ')+'',''+healthyKeys+'/'+totalKeys+' keys healthy')+
-  healthCard('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',avgCache<0.5?'warn':'ok','Cache Status','Hit rate '+pct(avgCache)+'',''+compact(s.cache_hits||0)+' hits / '+compact(s.cache_misses||0)+' misses')+
+  healthCard('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',overallCache<0.5?'warn':'ok','Cache Status','Hit rate '+pct(overallCache)+'',''+compact(num(mix.cache_read_tokens))+' hits / '+compact(cacheMisses)+' misses')+
   (exhaustedKeys>0?healthCard('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>','bad',''+exhaustedKeys+' Keys Exhausted','Provider keys need attention','Review in Virtual Keys'):'');
 
 // Metrics
@@ -2232,7 +2258,7 @@ el('overviewMetrics').innerHTML=
   metricCard('Completion',compact(s.output_tokens),'output',{cls:'down',text:''})+
   metricCard('Avg Latency',compact(s.avg_latency_ms)+' ms','24h',{cls:'down',text:''})+
   metricCard('Avg TTFT',compact(s.avg_ttft_ms)+' ms','24h',{cls:'down',text:''})+
-  metricCard('Cache Hit',pct(avgCache),'recent',{cls:'down',text:''})+
+  metricCard('Cache Hit',pct(overallCache),'24h token-weighted',{cls:'down',text:''})+
   metricCard('Cost',money(s.cost_cents),'total',{cls:'down',text:''})+
   metricCard('Slow/Error',compact(slow),'recent 100',{cls:slow>10?'up':'down',text:''});
 
@@ -2246,14 +2272,14 @@ if (providerKeys.length > 4) {
     providerKeys.map(k => {
       const st = stats[k.provider + '/' + k.id] || {};
       const rate = Math.round(num(st.success_rate) * 1000) / 10;
-      const cls = k.state === 'healthy' ? 'ok' : k.state === 'cooldown' ? 'warn' : 'bad';
+      const cls = k.state === 'healthy' || k.state === 'cooldown' ? 'ok' : 'bad';
       return '<div class="provider-table-row">' +
         '<div style="display:flex;align-items:center;gap:8px"><span class="status-dot status-' + cls + '"></span><span style="font-weight:500">' + esc(k.provider) + ' / ' + esc(k.id) + '</span></div>' +
         '<div>' + stateBadge(k.state) + '</div>' +
         '<div style="font-weight:600">' + rate + '%</div>' +
         '<div>' + compact(st.total_tokens || 0) + '</div>' +
         '<div>' + v(st.requests) + '</div>' +
-        '<div><button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="enable">Enable</button> <button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="cooldown">Cooldown</button> <button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="disable">Disable</button></div>' +
+        '<div><button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="enable">Enable</button> <button class="btn" data-p="' + esc(k.provider) + '" data-k="' + esc(k.id) + '" data-a="disable">Disable</button></div>' +
       '</div>';
     }).join('') + '</div></div>';
 } else {
@@ -2261,7 +2287,7 @@ if (providerKeys.length > 4) {
   el('providerCards').innerHTML = providerKeys.map(k => {
     const st = stats[k.provider + '/' + k.id] || {};
     const rate = Math.round(num(st.success_rate) * 1000) / 10;
-    const cls = k.state === 'healthy' ? 'ok' : k.state === 'cooldown' ? 'warn' : 'bad';
+    const cls = k.state === 'healthy' || k.state === 'cooldown' ? 'ok' : 'bad';
     return '<div class="provider-card" data-provider="' + esc(k.provider) + '" data-key="' + esc(k.id) + '">' +
       '<div class="provider-top"><div class="provider-name"><span class="status-dot status-' + cls + '"></span>' + esc(k.provider) + ' / ' + esc(k.id) + '</div>' + stateBadge(k.state) + '</div>' +
       '<div class="provider-stats">' +
@@ -2284,8 +2310,21 @@ el('incidentsTimeline').innerHTML=incidents.length?incidents.map(i=>'<div class=
 el('sideStatus').textContent=compact(s.requests)+' requests · '+compact(s.errors)+' errors';
 }
 
+// ─── TTFT ───
+function renderTTFT(ttft){
+  const o=(ttft&&ttft.overall)||{};
+  el('ttftMetrics').innerHTML=
+    metricCard('TTFT p50',compact(o.p50)+' ms','last 24h',{cls:o.p50<3000?'down':'up',text:o.p50<3000?'ok':'slow'})+
+    metricCard('TTFT p95',compact(o.p95)+' ms','last 24h',{cls:'down',text:''})+
+    metricCard('TTFT p99',compact(o.p99)+' ms','last 24h',{cls:'down',text:''});
+  const rows=(groups)=>groups.map(g=>'<div class="data-grid" style="grid-template-columns:minmax(140px,1fr) 80px 80px 80px 80px 80px"><div>'+esc(g.name)+'</div><div>'+compact(g.count)+'</div><div>'+compact(g.avg_ms)+' ms</div><div>'+compact(g.p50_ms)+' ms</div><div>'+compact(g.p95_ms)+' ms</div><div>'+compact(g.p99_ms)+' ms</div></div>').join('')||'<div class="empty-state" style="padding:20px">No data</div>';
+  el('ttftProviderRows').innerHTML=rows((ttft&&ttft.by_provider)||[]);
+  el('ttftModelRows').innerHTML=rows((ttft&&ttft.by_model)||[]);
+  el('ttftBucketRows').innerHTML=rows((ttft&&ttft.by_bucket)||[]);
+}
+
 // ─── Charts ───
-function renderBarChart(id,data){const max=Math.max(...data.map(d=>d.value),1);const elChart=el(id);if(!elChart)return;if(!data.length){elChart.innerHTML='<div class="chart-empty">No data available</div>';return}elChart.innerHTML='<div class="chart-bar">'+data.map(d=>'<div class="chart-bar-item" style="height:'+(d.value/max*100)+'%" title="'+d.label+': '+compact(d.value)+'"></div>').join('')+'</div><div class="chart-labels">'+data.map(d=>'<div class="chart-label">'+d.label+'</div>').join('')+'</div>';}
+function renderBarChart(id,data){const max=Math.max(...data.map(d=>d.value),1);const elChart=el(id);if(!elChart)return;if(!data.length){elChart.innerHTML='<div class="chart-empty">No data available</div>';return}elChart.innerHTML='<div class="chart-bar">'+data.map((d,i)=>'<div class="chart-bar-item" style="height:'+(d.value/max*100)+'%" data-label="'+esc(d.label)+'" data-value="'+d.value+'" data-idx="'+i+'"></div>').join('')+'</div><div class="chart-labels">'+data.map(d=>'<div class="chart-label">'+d.label+'</div>').join('')+'</div>';elChart.querySelectorAll('.chart-bar-item').forEach(bar=>{bar.addEventListener('mouseenter',e=>tooltip.show('<div class="label">'+esc(bar.dataset.label)+'</div><div class="value">'+compact(Number(bar.dataset.value))+'</div>',e.clientX,e.clientY));bar.addEventListener('mousemove',e=>tooltip.move(e.clientX,e.clientY));bar.addEventListener('mouseleave',()=>tooltip.hide())});}
 
 function renderLineChart(id, series) {
   const container = el(id);
@@ -2295,7 +2334,7 @@ function renderLineChart(id, series) {
     return;
   }
   const labels = series[0].data.map(d => d.label);
-  const width = 800, height = 200, padL = 46, padR = 12, padT = 10, padB = 28;
+  const width = Math.max(container.clientWidth || 800, 400), height = 200, padL = 46, padR = 12, padT = 10, padB = 28;
   const chartW = width - padL - padR, chartH = height - padT - padB;
   const allValues = series.flatMap(s => s.data.map(d => d.value));
   const maxY = Math.max(...allValues, 1);
@@ -2321,7 +2360,7 @@ function renderLineChart(id, series) {
     return d;
   }
 
-  let svg = '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">';
+  let svg = '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none" style="width:100%;height:100%;display:block">';
   const gridCount = 5;
   for (let i = 0; i <= gridCount; i++) {
     const gy = padT + (i / gridCount) * chartH;
@@ -2331,6 +2370,7 @@ function renderLineChart(id, series) {
   }
   svg += '<line class="axis" x1="' + padL + '" y1="' + (height - padB) + '" x2="' + (width - padR) + '" y2="' + (height - padB) + '"/>';
   const colors = ['var(--accent)', '#17c964', '#f5a623', '#ef4444'];
+  const hits = [];
   series.forEach((s, si) => {
     const color = s.color || colors[si % colors.length];
     let points = s.data.map((d, i) => [x(i), y(d.value)]);
@@ -2339,7 +2379,12 @@ function renderLineChart(id, series) {
     const lineD = smoothPath(points);
     svg += '<path class="area" style="fill:' + color + '" d="' + areaPath + '"/>';
     if (lineD) svg += '<path class="line" style="stroke:' + color + '" d="' + lineD + '"/>';
-    points.forEach(p => { svg += '<circle class="dot" style="fill:' + color + '" cx="' + p[0] + '" cy="' + p[1] + '"/>'; });
+    points.forEach((p, pi) => {
+      svg += '<circle class="dot" style="fill:' + color + '" cx="' + p[0] + '" cy="' + p[1] + '"/>';
+      const di = Math.min(pi, s.data.length - 1);
+      svg += '<circle class="dot-hit" cx="' + p[0] + '" cy="' + p[1] + '" r="10" fill="transparent" data-idx="' + pi + '" data-series="' + si + '"/>';
+      hits.push({idx:pi, si:si, label:s.label || 'Value', color:color, value:s.data[di].value, dateLabel:s.data[di].label});
+    });
   });
   const step = Math.ceil(labels.length / 7);
   labels.forEach((l, i) => {
@@ -2348,6 +2393,15 @@ function renderLineChart(id, series) {
   });
   svg += '</svg>';
   container.innerHTML = '<div class="line-chart">' + svg + '</div>';
+  container.querySelectorAll('.dot-hit').forEach(hit => {
+    hit.addEventListener('mouseenter', e => {
+      const d = hits.find(h => h.idx === parseInt(hit.dataset.idx) && h.si === parseInt(hit.dataset.series));
+      if (!d) return;
+      tooltip.show('<div class="label">' + esc(d.dateLabel) + '</div><div class="value" style="color:' + d.color + '">' + esc(d.label) + ': ' + compact(d.value) + '</div>', e.clientX, e.clientY);
+    });
+    hit.addEventListener('mousemove', e => tooltip.move(e.clientX, e.clientY));
+    hit.addEventListener('mouseleave', () => tooltip.hide());
+  });
 }
 
 // ─── Requests ───
@@ -2367,6 +2421,7 @@ el('requestRows').innerHTML=lastRows.map((r,i)=>'<div class="data-grid" data-idx
 
 // ─── Usage ───
 function renderUsage(usage){
+lastUsage=usage;
 const daily=usage.daily||[];
 const today=daily[0]||{};
 const totals=daily.reduce((a,d)=>({requests:a.requests+num(d.requests),errors:a.errors+num(d.errors),prompt:a.prompt+num(d.prompt_tokens),completion:a.completion+num(d.output_tokens)}),{requests:0,errors:0,prompt:0,completion:0});
@@ -2394,7 +2449,7 @@ function renderProviders(keydata){const stats={};(keydata.stats||[]).forEach(x=>
 const providers=[...new Set((keydata.keys||[]).map(k=>k.provider))];
 el('providerDetailCards').innerHTML=providers.map(p=>{
   const pkeys=(keydata.keys||[]).filter(k=>k.provider===p);
-  const healthy=pkeys.filter(k=>k.state==='healthy').length;
+  const healthy=pkeys.filter(k=>k.state==='healthy'||k.state==='cooldown').length;
   const total=pkeys.length;
   const pstats=pkeys.map(k=>stats[k.provider+'/'+k.id]||{});
   const totalReq=pstats.reduce((a,s)=>a+num(s.requests),0);
@@ -2402,9 +2457,9 @@ el('providerDetailCards').innerHTML=providers.map(p=>{
   const avgRate=Math.round(pstats.reduce((a,s)=>a+num(s.success_rate),0)/(pstats.length||1)*1000)/10;
   return'<div class="card card-pad">'+
     '<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">'+
-      '<span class="status-dot status-'+(healthy===total?'ok':healthy>0?'warn':'bad')+'"></span>'+
+      '<span class="status-dot status-'+(healthy===total?'ok':'bad')+'"></span>'+
       '<div style="font-size:16px;font-weight:600">'+esc(p)+'</div>'+
-      '<div style="margin-left:auto">'+stateBadge(healthy===total?'healthy':healthy>0?'cooldown':'disabled')+'</div>'+
+      '<div style="margin-left:auto">'+stateBadge(healthy===total?'healthy':'disabled')+'</div>'+
     '</div>'+
     '<div class="metric-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:0">'+
       metricCard('Keys',healthy+'/'+total,'healthy')+
@@ -2417,7 +2472,7 @@ el('providerDetailCards').innerHTML=providers.map(p=>{
       '<table><thead><tr><th>Key</th><th>State</th><th>Requests</th><th>Success</th><th>Errors</th><th>Tokens</th><th>Actions</th></tr></thead>'+
       '<tbody>'+pkeys.map(k=>{
         const st=stats[k.provider+'/'+k.id]||{};const rate=Math.round(num(st.success_rate)*1000)/10;
-        return'<tr><td class="cell-mono">'+esc(k.id)+'</td><td>'+stateBadge(k.state)+'</td><td>'+v(st.requests)+'</td><td>'+rate+'%</td><td>'+v(st.errors)+'</td><td>'+compact(st.total_tokens||0)+'</td><td><button class="btn" data-p="'+esc(k.provider)+'" data-k="'+esc(k.id)+'" data-a="enable">Enable</button> <button class="btn" data-p="'+esc(k.provider)+'" data-k="'+esc(k.id)+'" data-a="cooldown">Cooldown</button> <button class="btn" data-p="'+esc(k.provider)+'" data-k="'+esc(k.id)+'" data-a="disable">Disable</button></td></tr>';
+        return'<tr><td class="cell-mono">'+esc(k.id)+'</td><td>'+stateBadge(k.state)+'</td><td>'+v(st.requests)+'</td><td>'+rate+'%</td><td>'+v(st.errors)+'</td><td>'+compact(st.total_tokens||0)+'</td><td><button class="btn" data-p="'+esc(k.provider)+'" data-k="'+esc(k.id)+'" data-a="enable">Enable</button> <button class="btn" data-p="'+esc(k.provider)+'" data-k="'+esc(k.id)+'" data-a="disable">Disable</button></td></tr>';
       }).join('')+'</tbody></table>'+
     '</div>'+
   '</div>';
@@ -2440,7 +2495,9 @@ el('vkRows').innerHTML=(vkeys||[]).map(k=>{
 }
 
 // ─── Errors ───
-function renderErrors(errors){const breakdown=(errors.breakdown||[]).filter(b=>num(b.status_code)>=400);const total=breakdown.reduce((a,b)=>a+num(b.count),0);
+function renderErrors(errors){
+lastErrors=errors;
+const breakdown=(errors.breakdown||[]).filter(b=>num(b.status_code)>=400);const total=breakdown.reduce((a,b)=>a+num(b.count),0);
 const byCode={};breakdown.forEach(b=>{byCode[b.status_code]=num(byCode[b.status_code])+num(b.count)});
 el('errorMetrics').innerHTML=
   metricCard('Total Errors',compact(total),'24h')+
@@ -2478,8 +2535,8 @@ async function vkeyAction(id,a){await fetch(api('/dashboard/api/virtual-keys/'+i
 async function createVKey(){const btn=el('vkGenerateBtn');btn.disabled=true;btn.textContent='...';try{const body={user:el('vkUser').value||'default',allowed_models:el('vkModels').value.split(',').map(x=>x.trim()).filter(Boolean),rpm_limit:parseInt(el('vkRpm').value||'100'),tpm_limit:parseInt(el('vkTpm').value||'200000'),concurrency_limit:parseInt(el('vkConc').value||'10')};const data=await j(api('/dashboard/api/virtual-keys'),{method:'POST',headers:jsonHeaders(),body:JSON.stringify(body)});if(data&&data.api_key){el('vkGenerated').innerHTML='<div style="background:var(--green-bg);border:1px solid rgba(23,201,100,.2);border-radius:var(--radius-sm);padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px"><div><div style="font-size:12px;font-weight:500;color:var(--green);margin-bottom:4px">New key generated</div><div class="cell-mono" style="font-size:13px">'+esc(data.api_key)+'</div></div><button class="btn btn-primary" id="vkCopyBtn">Copy</button></div>';el('vkGenerated').style.display='block';el('vkCopyBtn').addEventListener('click',()=>navigator.clipboard.writeText(data.api_key));load();return}throw new Error('No key')}catch(e){el('vkGenerated').innerHTML='<div style="background:var(--red-bg);border:1px solid rgba(239,68,68,.2);border-radius:var(--radius-sm);padding:12px 16px;color:var(--red);font-size:13px">'+esc(e.message)+'</div>';el('vkGenerated').style.display='block'}finally{btn.disabled=false;btn.textContent='Generate Key'}}
 
 // ─── Load ───
-async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days='+periodDays()+'&limit=30'));const usageOverview=await j(api('/dashboard/api/usage?days=14&limit=14'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?limit=100'));
-renderOverview(s,rows||[],keydata,errors,usageOverview);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);}
+async function load(){const s=await j(api('/dashboard/api/summary?hours=24'));const usage=await j(api('/dashboard/api/usage?days='+periodDays()+'&limit=30'));const usageOverview=await j(api('/dashboard/api/usage?days=14&limit=14'));const keydata=await j(api('/dashboard/api/providers?hours=24'));const keyOverview=await j(api('/dashboard/api/keys-overview'));const errors=await j(api('/dashboard/api/errors?hours=24&limit=100'));const rows=await j(api('/dashboard/api/requests?limit=100'));const ttft=await j(api('/dashboard/api/ttft?hours=24'));
+renderOverview(s,rows||[],keydata,errors,usageOverview);renderRequests(rows||[]);renderUsage(usage);renderProviders(keydata);renderVirtualKeys(keyOverview.virtual_keys||[]);renderErrors(errors);renderTTFT(ttft);}
 
 // ─── Events ───
 document.addEventListener('click',e=>{

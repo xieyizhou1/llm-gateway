@@ -21,12 +21,13 @@ type OpenAIChatCompletionRequest struct {
 
 // OpenAIMessage 是 OpenAI 消息格式。
 type OpenAIMessage struct {
-	Role             string     `json:"role"`
-	Content          string     `json:"content"`
-	RawContent       []byte     `json:"-"`
-	ReasoningContent string     `json:"reasoning_content"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	RawContent       []byte          `json:"-"`
+	ReasoningContent string          `json:"reasoning_content"`
+	ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
+	ToolCallID       string          `json:"tool_call_id,omitempty"`
+	CacheControl     json.RawMessage `json:"cache_control,omitempty"`
 }
 
 // UnmarshalJSON accepts both classic text content and OpenAI multi-modal
@@ -40,6 +41,7 @@ func (m *OpenAIMessage) UnmarshalJSON(data []byte) error {
 		ReasoningContent string          `json:"reasoning_content"`
 		ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
 		ToolCallID       string          `json:"tool_call_id,omitempty"`
+		CacheControl     json.RawMessage `json:"cache_control,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -50,6 +52,7 @@ func (m *OpenAIMessage) UnmarshalJSON(data []byte) error {
 		ReasoningContent: raw.ReasoningContent,
 		ToolCalls:        raw.ToolCalls,
 		ToolCallID:       raw.ToolCallID,
+		CacheControl:     raw.CacheControl,
 	}
 	if len(raw.Content) == 0 || bytes.Equal(raw.Content, []byte("null")) {
 		return nil
@@ -77,11 +80,13 @@ func (m OpenAIMessage) MarshalJSON() ([]byte, error) {
 		ReasoningContent string          `json:"reasoning_content,omitempty"`
 		ToolCalls        []ToolCall      `json:"tool_calls,omitempty"`
 		ToolCallID       string          `json:"tool_call_id,omitempty"`
+		CacheControl     json.RawMessage `json:"cache_control,omitempty"`
 	}{
 		Role:             m.Role,
 		ReasoningContent: m.ReasoningContent,
 		ToolCalls:        m.ToolCalls,
 		ToolCallID:       m.ToolCallID,
+		CacheControl:     m.CacheControl,
 	}
 	if len(m.RawContent) > 0 && json.Valid(m.RawContent) {
 		raw.Content = append(raw.Content[:0], m.RawContent...)
@@ -188,11 +193,21 @@ type OpenAIChoice struct {
 	FinishReason string        `json:"finish_reason"`
 }
 
+// PromptTokensDetails mirrors OpenAI's prompt_tokens_details usage object.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
 // OpenAIUsage 记录 token 消耗。
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens          int                 `json:"prompt_tokens"`
+	CompletionTokens      int                 `json:"completion_tokens"`
+	TotalTokens           int                 `json:"total_tokens"`
+	CacheReadTokens       int                 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens      int                 `json:"cache_write_tokens,omitempty"`
+	PromptCacheHitTokens  int                 `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens int                 `json:"prompt_cache_miss_tokens,omitempty"`
+	PromptTokensDetails   PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
 // OpenAIStreamChunk 是 SSE 流式响应中的单个数据块。

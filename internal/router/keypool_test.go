@@ -204,7 +204,8 @@ func TestRouteWithOptionsRequiresImageCapableProvider(t *testing.T) {
 				Keys: []config.ProviderKey{
 					{ID: "kimi-1", Key: "kimi-key", RPMLimit: 60},
 				},
-				ModelMap: map[string]string{"kimi-for-coding": "kimi-for-coding"},
+				ModelMap:       map[string]string{"kimi-for-coding": "kimi-for-coding"},
+				SupportsImages: true,
 			},
 			DeepSeek: config.ProviderConfig{
 				BaseURL: "https://deepseek.test/v1",
@@ -314,9 +315,10 @@ func TestNewRouter(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis: config.RedisConfig{
 			Host: "localhost",
@@ -360,9 +362,10 @@ func TestRouterRoute(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis: config.RedisConfig{
 			Host: "localhost",
@@ -413,9 +416,10 @@ func TestRouterMarkKeyResult(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis: config.RedisConfig{
 			Host: "localhost",
@@ -470,9 +474,10 @@ func TestRouterHealthStatus(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis: config.RedisConfig{
 			Host: "localhost",
@@ -520,9 +525,10 @@ func TestRouterRouteRateLimitExceeded(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
@@ -555,9 +561,10 @@ func TestRouterRouteWithoutRedisClient(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
@@ -584,9 +591,10 @@ func TestRouterMarkKeyResult500(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
@@ -630,9 +638,10 @@ func TestRouterMarkKeyResultUnknownProvider(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
@@ -661,9 +670,10 @@ func TestRouterSetPoolForTest(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
@@ -700,9 +710,10 @@ func TestRouterDisableRateLimitForTest(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
@@ -727,6 +738,52 @@ func TestRouterDisableRateLimitForTest(t *testing.T) {
 	}
 }
 
+func TestKeyPoolMarkSuccessKeepsDisabled(t *testing.T) {
+	cfg := config.ProviderConfig{
+		BaseURL: "https://api.test.com",
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "test-key-1", Weight: 1, RPMLimit: 60},
+		},
+	}
+
+	pool := NewKeyPool("test", cfg)
+
+	pool.MarkDisabled("key-1")
+	pool.MarkSuccess("key-1")
+
+	_, err := pool.Next()
+	if err == nil {
+		t.Error("expected disabled key to stay disabled after MarkSuccess")
+	}
+}
+
+func TestKeyPoolMarkSuccessRecoversCooldown(t *testing.T) {
+	cfg := config.ProviderConfig{
+		BaseURL: "https://api.test.com",
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "test-key-1", Weight: 1, RPMLimit: 60},
+		},
+	}
+
+	pool := NewKeyPool("test", cfg)
+	pool.MarkCooldown("key-1", 5*time.Second)
+
+	_, err := pool.Next()
+	if err == nil {
+		t.Fatal("expected cooldown key to be unavailable")
+	}
+
+	pool.MarkSuccess("key-1")
+
+	key, err := pool.Next()
+	if err != nil {
+		t.Fatalf("expected cooldown key to recover after MarkSuccess, got %v", err)
+	}
+	if key.ID != "key-1" {
+		t.Errorf("expected key-1, got %s", key.ID)
+	}
+}
+
 func TestRouterSetModelMapForTest(t *testing.T) {
 	cfg := &config.Config{
 		Providers: config.ProvidersConfig{
@@ -738,9 +795,10 @@ func TestRouterSetModelMapForTest(t *testing.T) {
 			},
 		},
 		Router: config.RouterConfig{
-			Strategy:       "round_robin",
-			RetryCount:     2,
-			TimeoutSeconds: 30,
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
 		},
 		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
 		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},

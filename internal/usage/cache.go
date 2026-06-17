@@ -4,6 +4,8 @@ package usage
 import (
 	"encoding/json"
 	"strconv"
+
+	"llm-gateway/internal/models"
 )
 
 // CacheUsage stores the first-stage cache metrics that we keep in logs.
@@ -101,4 +103,34 @@ func parseOptionalFloatField(raw map[string]json.RawMessage, key string) (float6
 		return n, true
 	}
 	return 0, false
+}
+
+// CacheUsageFromOpenAIUsage extracts cache metrics from a parsed OpenAI usage
+// object. It normalises the different field names used by providers (OpenAI,
+// DeepSeek, Kimi) so streaming callbacks can record cache hits the same way
+// non-streaming responses do.
+func CacheUsageFromOpenAIUsage(u models.OpenAIUsage) CacheUsage {
+	out := CacheUsage{}
+
+	cacheRead := u.CacheReadTokens
+	if cacheRead == 0 && u.PromptTokensDetails.CachedTokens > 0 {
+		cacheRead = u.PromptTokensDetails.CachedTokens
+	}
+	if cacheRead == 0 && u.PromptCacheHitTokens > 0 {
+		cacheRead = u.PromptCacheHitTokens
+	}
+	out.CacheReadTokens = cacheRead
+	out.CacheWriteTokens = u.CacheWriteTokens
+
+	if u.PromptCacheHitTokens > 0 || u.PromptCacheMissTokens > 0 {
+		total := u.PromptCacheHitTokens + u.PromptCacheMissTokens
+		if total > 0 {
+			out.CacheHitRate = float64(u.PromptCacheHitTokens) / float64(total)
+		}
+		return out
+	}
+	if out.CacheReadTokens > 0 && u.PromptTokens > 0 {
+		out.CacheHitRate = float64(out.CacheReadTokens) / float64(u.PromptTokens)
+	}
+	return out
 }

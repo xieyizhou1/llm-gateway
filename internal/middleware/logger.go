@@ -58,6 +58,11 @@ func (l *Logger) Warn(traceID, module, event string, data map[string]interface{}
 	l.Log(LogEntry{Level: "WARN", TraceID: traceID, Module: module, Event: event, Data: data})
 }
 
+// Debug 输出 DEBUG 级别日志。
+func (l *Logger) Debug(traceID, module, event string, data map[string]interface{}) {
+	l.Log(LogEntry{Level: "DEBUG", TraceID: traceID, Module: module, Event: event, Data: data})
+}
+
 // Error 输出 ERROR 级别日志。
 func (l *Logger) Error(traceID, module, event string, err error, data map[string]interface{}) {
 	entry := LogEntry{Level: "ERROR", TraceID: traceID, Module: module, Event: event, Data: data}

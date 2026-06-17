@@ -65,10 +65,69 @@ const (
 	messageTextTruncationNote = "\n[message truncated]"
 )
 
+// DefaultMaxTokens is applied when a client does not specify max_tokens.
+// It must be large enough to accommodate both reasoning and final content.
+const DefaultMaxTokens = 4096
+
+// autoCacheMinChars is the minimum total message text size before we inject
+// prompt-caching hints. Tiny prompts do not benefit from cache writes.
+const autoCacheMinChars = 4096
+
+// ephemeralCacheControl is the OpenAI-compatible cache_control marker.
+var ephemeralCacheControl = json.RawMessage(`{"type":"ephemeral"}`)
+
+// NormalizeOpenAIRequest fills in provider-friendly defaults for a chat completions request.
+func NormalizeOpenAIRequest(req *models.OpenAIChatCompletionRequest) {
+	if req == nil {
+		return
+	}
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = DefaultMaxTokens
+	}
+}
+
+// InjectPromptCacheControl adds cache_control markers to all messages except the
+// final user message when the provider/model supports prompt caching and the
+// prompt is large enough to benefit. Existing client-provided markers are kept.
+func InjectPromptCacheControl(req *models.OpenAIChatCompletionRequest, supportsCache bool) {
+	if req == nil || !supportsCache || len(req.Messages) == 0 {
+		return
+	}
+	total := 0
+	for _, m := range req.Messages {
+		total += len(m.Content)
+		total += len(m.RawContent)
+	}
+	if total < autoCacheMinChars {
+		return
+	}
+	lastUser := -1
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			lastUser = i
+			break
+		}
+	}
+	for i := range req.Messages {
+		if i == lastUser {
+			continue
+		}
+		if len(req.Messages[i].CacheControl) == 0 {
+			req.Messages[i].CacheControl = ephemeralCacheControl
+		}
+	}
+}
+
 func compactReasoningForUpstream(messages []models.OpenAIMessage) {
 	remainingRecent := recentReasoningMessages
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role != "assistant" || strings.TrimSpace(messages[i].ReasoningContent) == "" {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+		if !isRealReasoning(messages[i].ReasoningContent) {
+			// Drop empty or placeholder reasoning so upstream providers never
+			// see "[previous reasoning omitted]" in their context.
+			messages[i].ReasoningContent = ""
 			continue
 		}
 
@@ -78,11 +137,21 @@ func compactReasoningForUpstream(messages []models.OpenAIMessage) {
 			continue
 		}
 
-		// Some upstream OpenAI-compatible providers require reasoning_content on
-		// assistant tool-call turns when thinking is enabled. Keep it present,
-		// but avoid replaying full historical reasoning on every request.
-		messages[i].ReasoningContent = reasoningPlaceholder
+		// Drop historical reasoning_content instead of using a placeholder.
+		// Placeholder text pollutes the model's context and gets echoed in the
+		// current reasoning. Upstream validation only needs the most recent
+		// assistant turn to carry reasoning_content when thinking is enabled.
+		messages[i].ReasoningContent = ""
 	}
+}
+
+// isRealReasoning reports whether a reasoning_content value carries actual
+// reasoning rather than an empty or placeholder string. WorkBuddy replays the
+// placeholder we emit in responses, so we must treat it as absent when
+// forwarding upstream to avoid confusing providers like Kimi.
+func isRealReasoning(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && s != reasoningPlaceholder
 }
 
 func compactToolResultsForUpstream(messages []models.OpenAIMessage) {
@@ -149,16 +218,21 @@ func trimLongText(s string, maxChars int, suffix string) string {
 func OpenAIToAnthropic(openAIResp *models.OpenAIChatCompletionResponse) *models.AnthropicMessageResponse {
 	content := make([]models.AnthropicContent, 0)
 	for _, c := range openAIResp.Choices {
+		// If the model only produced reasoning, surface it as visible text too.
+		messageContent := c.Message.Content
+		if strings.TrimSpace(messageContent) == "" && strings.TrimSpace(c.Message.ReasoningContent) != "" {
+			messageContent = c.Message.ReasoningContent
+		}
 		if c.Message.ReasoningContent != "" {
 			content = append(content, models.AnthropicContent{
 				Type:     "thinking",
 				Thinking: c.Message.ReasoningContent,
 			})
 		}
-		if c.Message.Content != "" {
+		if messageContent != "" {
 			content = append(content, models.AnthropicContent{
 				Type: "text",
-				Text: c.Message.Content,
+				Text: messageContent,
 			})
 		}
 		for _, tc := range c.Message.ToolCalls {
@@ -401,22 +475,31 @@ func ResponsesToOpenAI(req *models.ResponsesRequest) *models.OpenAIChatCompletio
 		Temperature:   req.Temperature,
 		Stream:        req.Stream,
 		StreamOptions: map[string]interface{}{"include_usage": true},
-		MaxTokens:     req.MaxOutputTokens,
+		MaxTokens:     defaultResponsesMaxTokens(req.MaxOutputTokens),
 		Tools:         ResponsesToolsToOpenAI(req.Tools),
 		ToolChoice:    req.ToolChoice,
 	}
 }
 
-// EnsureAssistantToolCallReasoning fills assistant tool-call turns with a
-// non-empty reasoning_content so upstream providers and replayed histories do
-// not drop the field via omitempty.
+func defaultResponsesMaxTokens(v int) int {
+	if v <= 0 {
+		return DefaultMaxTokens
+	}
+	return v
+}
+
+// EnsureAssistantToolCallReasoning ensures assistant tool-call turns do not
+// carry an empty or placeholder reasoning_content upstream. Some providers
+// reject the field when it is blank, and others (like Kimi) echo placeholder
+// text in their own reasoning, so we drop it and let omitempty remove it from
+// the JSON.
 func EnsureAssistantToolCallReasoning(messages []models.OpenAIMessage) {
 	for i := range messages {
 		if messages[i].Role != "assistant" || len(messages[i].ToolCalls) == 0 {
 			continue
 		}
-		if strings.TrimSpace(messages[i].ReasoningContent) == "" {
-			messages[i].ReasoningContent = reasoningPlaceholder
+		if !isRealReasoning(messages[i].ReasoningContent) {
+			messages[i].ReasoningContent = ""
 		}
 	}
 }
@@ -428,11 +511,16 @@ func EnsureAssistantToolCallReasoningInResponse(resp *models.OpenAIChatCompletio
 		return
 	}
 	for i := range resp.Choices {
-		if resp.Choices[i].Message.Role != "assistant" || len(resp.Choices[i].Message.ToolCalls) == 0 {
-			continue
+		msg := &resp.Choices[i].Message
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			if strings.TrimSpace(msg.ReasoningContent) == "" {
+				msg.ReasoningContent = reasoningPlaceholder
+			}
 		}
-		if strings.TrimSpace(resp.Choices[i].Message.ReasoningContent) == "" {
-			resp.Choices[i].Message.ReasoningContent = reasoningPlaceholder
+		// Surface reasoning as visible content when the model produced no answer text.
+		// This prevents empty replies for thinking-first providers like Kimi.
+		if strings.TrimSpace(msg.Content) == "" && strings.TrimSpace(msg.ReasoningContent) != "" {
+			msg.Content = msg.ReasoningContent
 		}
 	}
 }
@@ -463,8 +551,13 @@ func RewriteOpenAIStreamBodyWithReasoning(body io.Reader, w io.Writer, onFinishR
 					}
 				} else if chunk != nil {
 					for i := range chunk.Choices {
-						if len(chunk.Choices[i].Delta.ToolCalls) > 0 && strings.TrimSpace(chunk.Choices[i].Delta.ReasoningContent) == "" {
-							chunk.Choices[i].Delta.ReasoningContent = reasoningPlaceholder
+						if len(chunk.Choices[i].Delta.ToolCalls) > 0 {
+							// Keep real reasoning; use a placeholder only when the
+							// upstream stream omitted reasoning entirely. Some
+							// clients require a non-empty value on tool-call deltas.
+							if !isRealReasoning(chunk.Choices[i].Delta.ReasoningContent) {
+								chunk.Choices[i].Delta.ReasoningContent = reasoningPlaceholder
+							}
 						}
 						if onFinishReason != nil && chunk.Choices[i].FinishReason != nil && *chunk.Choices[i].FinishReason != "" {
 							onFinishReason(*chunk.Choices[i].FinishReason)
@@ -983,26 +1076,52 @@ func anthropicUserContentToOpenAI(content interface{}) []models.OpenAIMessage {
 	}
 
 	result := make([]models.OpenAIMessage, 0, len(blocks))
-	var pendingText strings.Builder
-	flushText := func() {
-		if pendingText.Len() == 0 {
+	var userParts []map[string]interface{}
+	flushUserParts := func() {
+		if len(userParts) == 0 {
+			return
+		}
+		// Preserve backward compatibility: plain text-only user messages use
+		// the simple string Content field rather than a RawContent array.
+		if len(userParts) == 1 && userParts[0]["type"] == "text" {
+			result = append(result, models.OpenAIMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("%v", userParts[0]["text"]),
+			})
+			userParts = nil
+			return
+		}
+		raw, err := json.Marshal(userParts)
+		if err != nil {
 			return
 		}
 		result = append(result, models.OpenAIMessage{
-			Role:    "user",
-			Content: pendingText.String(),
+			Role:       "user",
+			RawContent: raw,
 		})
-		pendingText.Reset()
+		userParts = nil
 	}
 
 	for _, block := range blocks {
 		switch strings.TrimSpace(firstString(block["type"])) {
 		case "text":
 			if text := firstString(block["text"]); text != "" {
-				pendingText.WriteString(text)
+				userParts = append(userParts, map[string]interface{}{
+					"type": "text",
+					"text": text,
+				})
+			}
+		case "image":
+			if imageURL := anthropicImageBlockToOpenAI(block); imageURL != "" {
+				userParts = append(userParts, map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]interface{}{
+						"url": imageURL,
+					},
+				})
 			}
 		case "tool_result":
-			flushText()
+			flushUserParts()
 			callID := firstString(block["tool_use_id"], block["id"])
 			if callID == "" {
 				continue
@@ -1022,8 +1141,30 @@ func anthropicUserContentToOpenAI(content interface{}) []models.OpenAIMessage {
 		}
 	}
 
-	flushText()
+	flushUserParts()
 	return result
+}
+
+// anthropicImageBlockToOpenAI converts an Anthropic image block to an OpenAI
+// image_url data URL. Anthropic format:
+//   {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+func anthropicImageBlockToOpenAI(block map[string]interface{}) string {
+	source, _ := block["source"].(map[string]interface{})
+	if source == nil {
+		return ""
+	}
+	if firstString(source["type"]) != "base64" {
+		return ""
+	}
+	mediaType := firstString(source["media_type"])
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	data, _ := source["data"].(string)
+	if data == "" {
+		return ""
+	}
+	return fmt.Sprintf("data:%s;base64,%s", mediaType, data)
 }
 
 func anthropicToolContentToOpenAI(content interface{}) []models.OpenAIMessage {

@@ -17,6 +17,7 @@ auth:
 providers:
   kimi:
     base_url: https://api.kimi.com/coding/v1
+    supports_images: true
     headers:
       User-Agent: claude-code/1.0
     keys:
@@ -50,12 +51,18 @@ providers:
       weight: 1
       rpm_limit: 60
       concurrency_limit: 5
+    - id: kimi-7
+      key: ${KIMI_KEY_7}
+      weight: 1
+      rpm_limit: 60
+      concurrency_limit: 5
     model_map:
       kimi-for-coding: kimi-for-coding
       claude-sonnet-4-6: kimi-for-coding
       gpt-5.5: kimi-for-coding
   deepseek:
     base_url: https://api.deepseek.com/v1
+    supports_images: false
     keys:
     - id: deepseek-1
       key: ${DEEPSEEK_KEY_1}

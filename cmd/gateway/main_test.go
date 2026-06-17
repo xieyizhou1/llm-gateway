@@ -233,7 +233,7 @@ func TestAnthropicStreamToolCallKeepsArgumentContinuation(t *testing.T) {
 				Arguments: `{"command":"pwd"}`,
 			},
 		})
-		state.finish(c, "tool_calls")
+		state.finish(c, "tool_calls", nil)
 		return nil
 	})
 
@@ -567,8 +567,7 @@ func TestDashboardHTMLUsesModuleAPIsAndStoredToken(t *testing.T) {
 		"/dashboard/api/providers",
 		"/dashboard/api/keys-overview",
 		"/dashboard/api/errors",
-		"/dashboard/requests/",
-		"</div></section><section id=\"usage\"",
+		"<section id=\"usage\" class=\"view\">",
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("dashboard html missing %q", want)

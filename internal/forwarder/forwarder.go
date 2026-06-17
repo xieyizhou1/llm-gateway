@@ -9,20 +9,49 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"llm-gateway/internal/config"
 	"llm-gateway/internal/models"
 	"llm-gateway/internal/router"
 )
 
+// traceIDKey is the context key used to carry the gateway trace_id into the
+// forwarder for logging purposes.
+type traceIDKey struct{}
+
+// WithTraceID returns a context that carries the gateway trace_id.
+func WithTraceID(ctx context.Context, traceID string) context.Context {
+	return context.WithValue(ctx, traceIDKey{}, traceID)
+}
+
+func traceIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(traceIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // Forwarder 负责将请求转发到上游 Provider。
 type Forwarder struct {
-	client     *http.Client
-	router     *router.Router
-	timeout    time.Duration
-	retryCount int
+	client       *http.Client
+	router       *router.Router
+	timeout      time.Duration
+	retryCount   int
+	logger       Logger
+	warmupPath   string
+	heartbeatStop chan struct{}
+}
+
+// Logger is the subset of the middleware logger used by the forwarder.
+type Logger interface {
+	Debug(traceID, module, event string, data map[string]interface{})
+	Info(traceID, module, event string, data map[string]interface{})
+	Error(traceID, module, event string, err error, data map[string]interface{})
 }
 
 // ResponseInfo describes the selected upstream route for observability.
@@ -43,13 +72,212 @@ type ForwardResponse struct {
 // NewForwarder 创建 Forwarder 实例。
 func NewForwarder(r *router.Router, timeout time.Duration, retryCount int) *Forwarder {
 	return &Forwarder{
-		client: &http.Client{
-			Timeout: timeout,
-		},
-		router:     r,
-		timeout:    timeout,
-		retryCount: retryCount,
+		client:        newPooledHTTPClient(timeout),
+		router:        r,
+		timeout:       timeout,
+		retryCount:    retryCount,
+		warmupPath:    "/models",
+		heartbeatStop: make(chan struct{}),
 	}
+}
+
+// newPooledHTTPClient 创建带连接池的 http.Client，复用到同一上游的 TLS/TCP 连接，
+// 降低大 prompt 首次请求的 TTFT。
+func newPooledHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          200,
+			MaxIdleConnsPerHost:   100,
+			MaxConnsPerHost:       200,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
+
+// SetWarmupPath 设置预热时访问的 endpoint，默认为 "/models"。
+func (f *Forwarder) SetWarmupPath(path string) {
+	f.warmupPath = path
+}
+
+// StartHeartbeat 启动后台心跳：每隔 interval 对每个 provider key 探测一次可通性，
+// 根据结果更新 key 的 State/LastSeen，让 dashboard 显示真实的在线状态。
+func (f *Forwarder) StartHeartbeat(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-f.heartbeatStop:
+				return
+			case <-ticker.C:
+				f.runHeartbeat(ctx)
+			}
+		}
+	}()
+}
+
+func (f *Forwarder) runHeartbeat(ctx context.Context) {
+	endpoints := f.router.ProviderEndpoints()
+	var wg sync.WaitGroup
+	for _, ep := range endpoints {
+		if ep.BaseURL == "" {
+			continue
+		}
+		for _, key := range ep.Keys {
+			if key.Key == "" {
+				continue
+			}
+			wg.Add(1)
+			go func(ep router.ProviderEndpoint, key config.ProviderKey) {
+				defer wg.Done()
+				f.heartbeatKey(ctx, ep, key)
+			}(ep, key)
+		}
+	}
+	wg.Wait()
+}
+
+func (f *Forwarder) heartbeatKey(ctx context.Context, ep router.ProviderEndpoint, key config.ProviderKey) {
+	url := strings.TrimRight(ep.BaseURL, "/") + f.warmupPath
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		f.router.MarkKeyResult(ep.Provider, key.ID, http.StatusServiceUnavailable)
+		return
+	}
+
+	for k, v := range ep.Headers {
+		if k != "" && v != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	req.Header.Set("Authorization", "Bearer "+key.Key)
+
+	resp, err := f.client.Do(req)
+	if err != nil {
+		if f.logger != nil {
+			f.logger.Error("", "forwarder", "heartbeat_failed", err, map[string]interface{}{
+				"provider": ep.Provider,
+				"key_id":   key.ID,
+				"url":      url,
+			})
+		}
+		f.router.MarkKeyResult(ep.Provider, key.ID, http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	status := resp.StatusCode
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// key 本身有问题，永久禁用，需要人工处理
+		f.router.MarkKeyResult(ep.Provider, key.ID, status)
+	} else if status >= http.StatusInternalServerError {
+		f.router.MarkKeyResult(ep.Provider, key.ID, status)
+	} else {
+		// 2xx/3xx/429 都说明网络可通；429 表示限流，不表示 key 挂了
+		f.router.MarkKeyResult(ep.Provider, key.ID, http.StatusOK)
+	}
+
+	if f.logger != nil {
+		f.logger.Debug("", "forwarder", "heartbeat_ok", map[string]interface{}{
+			"provider": ep.Provider,
+			"key_id":   key.ID,
+			"url":      url,
+			"status":   status,
+		})
+	}
+}
+
+// SetLogger attaches a logger for DEBUG output.
+func (f *Forwarder) SetLogger(l Logger) {
+	f.logger = l
+}
+
+// Warmup 预先与所有配置的上游 Provider 建立 TCP/TLS 连接，
+// 把连接放进 http.Transport 的 idle pool，避免第一个真实请求触发 TLS 握手。
+// 预热失败只记录日志，不会阻塞网关启动。
+func (f *Forwarder) Warmup(ctx context.Context) {
+	endpoints := f.router.ProviderEndpoints()
+	if len(endpoints) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, ep := range endpoints {
+		wg.Add(1)
+		go func(ep router.ProviderEndpoint) {
+			defer wg.Done()
+			f.warmupEndpoint(ctx, ep)
+		}(ep)
+	}
+	wg.Wait()
+}
+
+func (f *Forwarder) warmupEndpoint(ctx context.Context, ep router.ProviderEndpoint) {
+	if ep.BaseURL == "" {
+		return
+	}
+
+	url := strings.TrimRight(ep.BaseURL, "/") + f.warmupPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		f.logWarmup(ep.Provider, url, err)
+		return
+	}
+
+	for k, v := range ep.Headers {
+		if k != "" && v != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	// 部分 Provider 对 /models 也要求鉴权；使用第一个 key 避免 401 导致连接被关闭。
+	if len(ep.Keys) > 0 && ep.Keys[0].Key != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.Keys[0].Key)
+	}
+
+	resp, err := f.client.Do(req)
+	if err != nil {
+		f.logWarmup(ep.Provider, url, err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if f.logger != nil {
+		f.logger.Debug("", "forwarder", "warmup_ok", map[string]interface{}{
+			"provider": ep.Provider,
+			"url":      url,
+			"status":   resp.StatusCode,
+		})
+	}
+}
+
+func (f *Forwarder) logWarmup(provider, url string, err error) {
+	if f.logger == nil {
+		return
+	}
+	f.logger.Debug("", "forwarder", "warmup_failed", map[string]interface{}{
+		"provider": provider,
+		"url":      url,
+		"error":    err.Error(),
+	})
 }
 
 // ForwardOpenAIRequest 转发 OpenAI 格式的请求到上游 Provider。
@@ -110,6 +338,16 @@ func (f *Forwarder) forwardWithRetry(ctx context.Context, req *models.OpenAIChat
 		body, err := json.Marshal(&reqCopy)
 		if err != nil {
 			return nil, fmt.Errorf("marshal request: %w", err)
+		}
+
+		if f.logger != nil {
+			f.logger.Debug(traceIDFromContext(ctx), "forwarder", "upstream_request", map[string]interface{}{
+				"provider":       route.Provider,
+				"key_id":         route.Key.ID,
+				"upstream_model": mappedModel,
+				"attempt":        attempt,
+				"body":           truncateForLog(string(body), 16000),
+			})
 		}
 
 		resp, err := f.doRequest(ctx, route.BaseURL+"/chat/completions", body, route.Key.Key, route.Headers)
@@ -290,6 +528,13 @@ func shouldRetryUpstreamStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
 }
 
+func truncateForLog(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...[truncated]"
+}
+
 func (f *Forwarder) doRequest(ctx context.Context, url string, body []byte, apiKey string, headers map[string]string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -338,5 +583,6 @@ func StreamResponse(src io.ReadCloser, dst http.ResponseWriter) error {
 
 // Close 关闭 Forwarder 的资源。
 func (f *Forwarder) Close() {
+	close(f.heartbeatStop)
 	f.client.CloseIdleConnections()
 }

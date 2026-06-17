@@ -56,10 +56,11 @@ type ProvidersConfig struct {
 
 // ProviderConfig 定义单个 Provider 的 BaseURL、Key 池和模型映射。
 type ProviderConfig struct {
-	BaseURL  string            `mapstructure:"base_url"`
-	Headers  map[string]string `mapstructure:"headers"`
-	Keys     []ProviderKey     `mapstructure:"keys"`
-	ModelMap map[string]string // 手动加载，避免 viper 解析带点键出错
+	BaseURL       string            `mapstructure:"base_url"`
+	Headers       map[string]string `mapstructure:"headers"`
+	Keys          []ProviderKey     `mapstructure:"keys"`
+	ModelMap      map[string]string // 手动加载，避免 viper 解析带点键出错
+	SupportsImages bool              `mapstructure:"supports_images"`
 }
 
 // ProviderKey 是 Provider 的真实 API Key 配置。
