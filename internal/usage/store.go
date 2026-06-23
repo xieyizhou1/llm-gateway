@@ -436,7 +436,7 @@ func (s *Store) Summary(ctx context.Context, hours int) (Summary, error) {
 	start := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 	out := Summary{ByProvider: map[string]int64{}, ByModel: map[string]int64{}, WindowStartsAt: start}
 	var avgLatency, avgTTFT, avgGeneration float64
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(total_tokens),0),
 		COALESCE(SUM(cost_cents),0), COALESCE(AVG(latency_ms),0), COALESCE(AVG(ttft_ms),0),
 		COALESCE(AVG(generation_ms),0)
@@ -505,18 +505,18 @@ func (s *Store) Daily(ctx context.Context, days int) ([]DailyUsage, error) {
 		days = 14
 	}
 	start := time.Now().UTC().AddDate(0, 0, -days+1).Format("2006-01-02")
-	rows, err := s.db.QueryContext(ctx, `SELECT date_key, COUNT(*), SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END),
+	rows, err := s.db.QueryContext(ctx, `SELECT date_key, COUNT(*), COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_cents),0)
 		FROM request_logs WHERE date_key >= ? GROUP BY date_key ORDER BY date_key DESC`, start)
 	if err != nil {
-		return nil, err
+		return []DailyUsage{}, err
 	}
 	defer rows.Close()
-	var out []DailyUsage
+	out := make([]DailyUsage, 0)
 	for rows.Next() {
 		var item DailyUsage
 		if err := rows.Scan(&item.Date, &item.Requests, &item.Errors, &item.PromptTokens, &item.OutputTokens, &item.CostCents); err != nil {
-			return nil, err
+			return []DailyUsage{}, err
 		}
 		out = append(out, item)
 	}
@@ -582,7 +582,7 @@ func (s *Store) KeyStats(ctx context.Context, hours int) ([]KeyStat, error) {
 	}
 	start := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 	rows, err := s.db.QueryContext(ctx, `SELECT provider, provider_key_id, COUNT(*),
-		SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), COALESCE(SUM(total_tokens),0)
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0), COALESCE(SUM(total_tokens),0)
 		FROM request_logs WHERE created_at >= ? AND provider != '' AND provider_key_id != ''
 		GROUP BY provider, provider_key_id`, start.Format(time.RFC3339Nano))
 	if err != nil {

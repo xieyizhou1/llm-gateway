@@ -150,10 +150,11 @@ func main() {
 		cancel()
 	}
 
-	// 启动后台心跳：每 30 秒对每个 provider key 探测 /models，更新真实可通状态。
+	// 后台心跳已禁用：不再每 30 秒探测 provider key，避免持续向上游发送 /models 请求。
+	// 如需恢复，将下面的 interval 改回 30*time.Second。
 	{
 		heartbeatCtx, cancel := context.WithCancel(context.Background())
-		fwd.StartHeartbeat(heartbeatCtx, 30*time.Second)
+		fwd.StartHeartbeat(heartbeatCtx, 0)
 		defer cancel()
 	}
 
