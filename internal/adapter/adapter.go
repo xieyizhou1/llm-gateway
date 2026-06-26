@@ -17,6 +17,9 @@ import (
 
 // AnthropicToOpenAI 将 Anthropic 请求转换为 OpenAI 请求格式。
 func AnthropicToOpenAI(req *models.AnthropicMessageRequest) *models.OpenAIChatCompletionRequest {
+	if req == nil {
+		return nil
+	}
 	messages := make([]models.OpenAIMessage, 0, len(req.Messages)+1)
 
 	// Anthropic 顶层 system → OpenAI messages 中 role: "system"
@@ -217,6 +220,9 @@ func trimLongText(s string, maxChars int, suffix string) string {
 
 // AnthropicToOpenAIResponse 将 Anthropic 响应转换为 OpenAI 响应格式。
 func AnthropicToOpenAIResponse(anthropicResp *models.AnthropicMessageResponse) *models.OpenAIChatCompletionResponse {
+	if anthropicResp == nil {
+		return nil
+	}
 	message := models.OpenAIMessage{
 		Role: "assistant",
 	}
@@ -299,6 +305,9 @@ func mapAnthropicStopReason(reason string) string {
 
 // OpenAIToAnthropic 将 OpenAI 响应转换为 Anthropic 响应格式。
 func OpenAIToAnthropic(openAIResp *models.OpenAIChatCompletionResponse) *models.AnthropicMessageResponse {
+	if openAIResp == nil {
+		return nil
+	}
 	content := make([]models.AnthropicContent, 0)
 	for _, c := range openAIResp.Choices {
 		// If the model only produced reasoning, surface it as visible text too.
@@ -451,6 +460,9 @@ func ExtractSystemMessage(messages []models.OpenAIMessage) (string, []models.Ope
 
 // OpenAIToAnthropicRequest 将 OpenAI 请求转换为 Anthropic 请求（用于测试或反向场景）。
 func OpenAIToAnthropicRequest(req *models.OpenAIChatCompletionRequest) *models.AnthropicMessageRequest {
+	if req == nil {
+		return nil
+	}
 	system, filtered := ExtractSystemMessage(req.Messages)
 
 	anthropicMessages := make([]models.AnthropicMessage, 0, len(filtered))

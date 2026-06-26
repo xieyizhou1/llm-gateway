@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,7 +26,6 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
@@ -165,7 +165,19 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	})
 
-	app.Use(recover.New())
+	app.Use(func(c *fiber.Ctx) error {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error(mw.ExtractTraceID(c), "handler", "panic_recovered", fmt.Errorf("%v", r), map[string]interface{}{
+					"path":   c.Path(),
+					"method": c.Method(),
+					"stack":  string(debug.Stack()),
+				})
+				_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
+			}
+		}()
+		return c.Next()
+	})
 	app.Use(mw.TraceIDMiddleware())
 	app.Use(mw.RequestLogMiddleware(logger))
 	app.Use(mw.MetricsMiddleware())
