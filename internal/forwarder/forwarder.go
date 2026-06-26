@@ -533,7 +533,10 @@ func (f *Forwarder) forwardRawWithRetry(ctx context.Context, body []byte, model 
 }
 
 func shouldRetryUpstreamStatus(statusCode int) bool {
-	return statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+	return statusCode == http.StatusUnauthorized ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusPaymentRequired ||
+		statusCode >= http.StatusInternalServerError
 }
 
 // effectiveStatusFromResponse peeks at a response body that some providers return
