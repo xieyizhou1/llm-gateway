@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -15,11 +16,72 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"llm-gateway/internal/auth"
 	"llm-gateway/internal/config"
+	"llm-gateway/internal/forwarder"
 	mw "llm-gateway/internal/middleware"
 	"llm-gateway/internal/models"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/usage"
 )
+
+const testVirtualKey = "sk-virtual-test"
+
+func setupRealGatewayApp(t *testing.T, upstream *httptest.Server, modelMap map[string]string) (*fiber.App, *usage.Store) {
+	t.Helper()
+
+	store, err := usage.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatalf("open usage store: %v", err)
+	}
+
+	authService := auth.NewAuth(&config.AuthConfig{
+		VirtualKeys: []config.VirtualKey{
+			{
+				Key:           testVirtualKey,
+				AllowedModels: []string{"claude-sonnet", "gpt-5.5", "gpt-4o"},
+				RPMLimit:      100,
+			},
+		},
+	})
+
+	cfg := &config.Config{
+		Providers: config.ProvidersConfig{
+			Kimi: config.ProviderConfig{
+				BaseURL:  upstream.URL,
+				ModelMap: modelMap,
+				Keys:     []config.ProviderKey{{ID: "key-1", Key: "sk-test", Weight: 1, RPMLimit: 60}},
+			},
+			DeepSeek: config.ProviderConfig{},
+		},
+		Router: config.RouterConfig{
+			Strategy:        "round_robin",
+			RetryCount:      1,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
+			ProviderOrder:   []string{"kimi"},
+		},
+		ModelCapabilities: map[string]config.ModelCapability{
+			"claude-sonnet": {SupportsCache: true},
+		},
+	}
+
+	r := router.NewRouter(cfg, nil)
+	r.DisableRateLimitForTest()
+
+	fwd := forwarder.NewForwarder(r, 10*time.Second, cfg.Router.RetryCount)
+	logger := mw.NewLogger("INFO")
+
+	app := fiber.New(fiber.Config{
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+	})
+	app.Use(mw.TraceIDMiddleware())
+	app.Use(mw.RequestLogMiddleware(logger))
+
+	app.Post("/v1/messages", authService.Middleware(), handleAnthropicMessages(fwd, logger, r, store))
+	app.Post("/v1/responses", authService.Middleware(), handleResponses(fwd, logger, r, store))
+
+	return app, store
+}
 
 func setupTestApp() *fiber.App {
 	app := fiber.New(fiber.Config{
@@ -105,19 +167,400 @@ func setupTestApp() *fiber.App {
 	return app
 }
 
-func TestHealthEndpoint(t *testing.T) {
-	app := setupTestApp()
-	req := httptest.NewRequest("GET", "/health", nil)
+func TestAnthropicMessagesEndToEndNonStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("expected /chat/completions, got %s", r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req models.OpenAIChatCompletionRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("invalid request body: %v", err)
+		}
+		if req.Model != "claude-sonnet-mapped" {
+			t.Errorf("expected mapped model claude-sonnet-mapped, got %s", req.Model)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(models.OpenAIChatCompletionResponse{
+			ID:      "chatcmpl-test",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "claude-sonnet-mapped",
+			Choices: []models.OpenAIChoice{
+				{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: "Hello from Anthropic"},
+					FinishReason: "stop",
+				},
+			},
+			Usage: models.OpenAIUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
+		})
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"claude-sonnet": "claude-sonnet-mapped"})
+
+	reqBody, _ := json.Marshal(models.AnthropicMessageRequest{
+		Model:     "claude-sonnet",
+		Messages:  []models.AnthropicMessage{{Role: "user", Content: "Hi"}},
+		MaxTokens: 100,
+	})
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
 	resp, err := app.Test(req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if resp.StatusCode != 200 {
-		t.Errorf("expected status 200, got %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var result models.AnthropicMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.Role != "assistant" {
+		t.Errorf("expected role assistant, got %s", result.Role)
+	}
+	if len(result.Content) != 1 || result.Content[0].Text != "Hello from Anthropic" {
+		t.Errorf("unexpected content: %+v", result.Content)
+	}
+	if result.StopReason != "end_turn" {
+		t.Errorf("expected stop_reason end_turn, got %s", result.StopReason)
+	}
+	if result.Usage.InputTokens != 10 || result.Usage.OutputTokens != 5 {
+		t.Errorf("unexpected usage: %+v", result.Usage)
 	}
 }
 
-func TestOpenAIChatCompletionsWithoutAuth(t *testing.T) {
+func TestAnthropicMessagesEndToEndStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-mapped\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n"))
+		w.Write([]byte("data: {\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-mapped\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"claude-sonnet": "claude-sonnet-mapped"})
+
+	reqBody, _ := json.Marshal(models.AnthropicMessageRequest{
+		Model:     "claude-sonnet",
+		Stream:    true,
+		Messages:  []models.AnthropicMessage{{Role: "user", Content: "Hi"}},
+		MaxTokens: 100,
+	})
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	got := string(body)
+	if !strings.Contains(got, "Hello") || !strings.Contains(got, " world") {
+		t.Errorf("expected streamed text 'Hello world', got %s", got)
+	}
+	if !strings.Contains(got, `"type":"message_stop"`) {
+		t.Errorf("expected message_stop event, got %s", got)
+	}
+}
+
+func TestAnthropicMessagesEndToEndToolUse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(models.OpenAIChatCompletionResponse{
+			ID:      "chatcmpl-tool",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "claude-sonnet-mapped",
+			Choices: []models.OpenAIChoice{
+				{
+					Index: 0,
+					Message: models.OpenAIMessage{
+						Role:    "assistant",
+						Content: "",
+						ToolCalls: []models.ToolCall{
+							{
+								ID:   "call_123",
+								Type: "function",
+								Function: models.FunctionCall{
+									Name:      "shell_command",
+									Arguments: `{"command":"pwd"}`,
+								},
+							},
+						},
+					},
+					FinishReason: "tool_calls",
+				},
+			},
+			Usage: models.OpenAIUsage{PromptTokens: 20, CompletionTokens: 10, TotalTokens: 30},
+		})
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"claude-sonnet": "claude-sonnet-mapped"})
+
+	reqBody, _ := json.Marshal(models.AnthropicMessageRequest{
+		Model:     "claude-sonnet",
+		MaxTokens: 100,
+		Messages:  []models.AnthropicMessage{{Role: "user", Content: "Run pwd"}},
+		Tools: []models.AnthropicTool{
+			{
+				Name:        "shell_command",
+				Description: "Run shell command",
+				InputSchema: map[string]interface{}{"type": "object"},
+			},
+		},
+	})
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var result models.AnthropicMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.StopReason != "tool_use" {
+		t.Errorf("expected stop_reason tool_use, got %s", result.StopReason)
+	}
+	if len(result.Content) != 1 || result.Content[0].Type != "tool_use" {
+		t.Fatalf("expected tool_use content, got %+v", result.Content)
+	}
+	if result.Content[0].Name != "shell_command" {
+		t.Errorf("expected tool name shell_command, got %s", result.Content[0].Name)
+	}
+}
+
+func TestAnthropicMessagesEndToEndModelNotAllowed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("upstream should not be called for disallowed model")
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"claude-sonnet": "claude-sonnet-mapped"})
+
+	reqBody, _ := json.Marshal(models.AnthropicMessageRequest{
+		Model:     "claude-opus",
+		Messages:  []models.AnthropicMessage{{Role: "user", Content: "Hi"}},
+		MaxTokens: 100,
+	})
+	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 403 {
+		t.Errorf("expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestResponsesEndToEndNonStreamText(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("expected /chat/completions, got %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(models.OpenAIChatCompletionResponse{
+			ID:      "chatcmpl-resp",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "kimi-for-coding",
+			Choices: []models.OpenAIChoice{
+				{
+					Index:        0,
+					Message:      models.OpenAIMessage{Role: "assistant", Content: "Hello from Responses"},
+					FinishReason: "stop",
+				},
+			},
+			Usage: models.OpenAIUsage{PromptTokens: 8, CompletionTokens: 4, TotalTokens: 12},
+		})
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"gpt-5.5": "kimi-for-coding"})
+
+	reqBody, _ := json.Marshal(models.ResponsesRequest{
+		Model:        "gpt-5.5",
+		Instructions: "Be helpful",
+		Input:        "Hi",
+	})
+	req := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var result models.ResponsesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.Model != "kimi-for-coding" {
+		t.Errorf("expected model kimi-for-coding, got %s", result.Model)
+	}
+	if len(result.Output) != 1 || result.Output[0].Type != "message" {
+		t.Fatalf("expected 1 message output, got %+v", result.Output)
+	}
+	if len(result.Output[0].Content) != 1 || result.Output[0].Content[0].Text != "Hello from Responses" {
+		t.Errorf("unexpected output content: %+v", result.Output[0].Content)
+	}
+}
+
+func TestResponsesEndToEndFunctionCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(models.OpenAIChatCompletionResponse{
+			ID:      "chatcmpl-func",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "kimi-for-coding",
+			Choices: []models.OpenAIChoice{
+				{
+					Index: 0,
+					Message: models.OpenAIMessage{
+						Role:    "assistant",
+						Content: "",
+						ToolCalls: []models.ToolCall{
+							{
+								ID:   "call_456",
+								Type: "function",
+								Function: models.FunctionCall{
+									Name:      "shell_command",
+									Arguments: `{"command":"ls"}`,
+								},
+							},
+						},
+					},
+					FinishReason: "tool_calls",
+				},
+			},
+			Usage: models.OpenAIUsage{PromptTokens: 15, CompletionTokens: 8, TotalTokens: 23},
+		})
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"gpt-5.5": "kimi-for-coding"})
+
+	reqBody, _ := json.Marshal(models.ResponsesRequest{
+		Model: "gpt-5.5",
+		Input: []interface{}{
+			map[string]interface{}{"type": "message", "role": "user", "content": "List files"},
+		},
+		Tools: []models.ResponsesTool{
+			{
+				Type:        "function",
+				Name:        "shell_command",
+				Description: "Run a command",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"command": map[string]interface{}{"type": "string"},
+					},
+					"required": []string{"command"},
+				},
+			},
+		},
+	})
+	req := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var result models.ResponsesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(result.Output) != 2 {
+		t.Fatalf("expected 2 outputs (message + function_call), got %d", len(result.Output))
+	}
+	if result.Output[1].Type != "function_call" {
+		t.Errorf("expected function_call output, got %s", result.Output[1].Type)
+	}
+	if result.Output[1].Name != "shell_command" || result.Output[1].Arguments != `{"command":"ls"}` {
+		t.Errorf("unexpected function_call: %+v", result.Output[1])
+	}
+}
+
+func TestResponsesEndToEndStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"id\":\"chatcmpl-resp-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"kimi-for-coding\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n"))
+		w.Write([]byte("data: {\"id\":\"chatcmpl-resp-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"kimi-for-coding\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" Responses\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	app, _ := setupRealGatewayApp(t, upstream, map[string]string{"gpt-5.5": "kimi-for-coding"})
+
+	reqBody, _ := json.Marshal(models.ResponsesRequest{
+		Model:  "gpt-5.5",
+		Input:  "Hi",
+		Stream: true,
+	})
+	req := httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testVirtualKey)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	got := string(body)
+	if !strings.Contains(got, "Hello") || !strings.Contains(got, "Responses") {
+		t.Errorf("expected streamed text, got %s", got)
+	}
+	if !strings.Contains(got, "[DONE]") {
+		t.Errorf("expected [DONE] terminator, got %s", got)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
 	app := setupTestApp()
 	reqBody, _ := json.Marshal(models.OpenAIChatCompletionRequest{
 		Model:    "gpt-4",

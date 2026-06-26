@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"time"
 
 	"llm-gateway/internal/models"
 )
@@ -214,6 +215,88 @@ func trimLongText(s string, maxChars int, suffix string) string {
 	return s[:limit] + suffix
 }
 
+// AnthropicToOpenAIResponse 将 Anthropic 响应转换为 OpenAI 响应格式。
+func AnthropicToOpenAIResponse(anthropicResp *models.AnthropicMessageResponse) *models.OpenAIChatCompletionResponse {
+	message := models.OpenAIMessage{
+		Role: "assistant",
+	}
+	finishReason := mapAnthropicStopReason(anthropicResp.StopReason)
+
+	for _, block := range anthropicResp.Content {
+		switch block.Type {
+		case "text":
+			if message.Content != "" {
+				message.Content += "\n"
+			}
+			message.Content += block.Text
+		case "thinking":
+			if message.ReasoningContent != "" {
+				message.ReasoningContent += "\n"
+			}
+			message.ReasoningContent += block.Thinking
+		case "tool_use":
+			callID := block.ID
+			if callID == "" {
+				callID = "call_" + randomID()
+			}
+			args := "{}"
+			if block.Input != nil {
+				if s, ok := block.Input.(string); ok {
+					s = strings.TrimSpace(s)
+					if s != "" {
+						args = s
+					}
+				} else if b, err := json.Marshal(block.Input); err == nil {
+					args = string(b)
+				}
+			}
+			message.ToolCalls = append(message.ToolCalls, models.ToolCall{
+				ID:   callID,
+				Type: "function",
+				Function: models.FunctionCall{
+					Name:      block.Name,
+					Arguments: args,
+				},
+			})
+			if finishReason == "stop" {
+				finishReason = "tool_calls"
+			}
+		}
+	}
+
+	return &models.OpenAIChatCompletionResponse{
+		ID:      anthropicResp.ID,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   anthropicResp.Model,
+		Choices: []models.OpenAIChoice{
+			{
+				Index:        0,
+				Message:      message,
+				FinishReason: finishReason,
+			},
+		},
+		Usage: models.OpenAIUsage{
+			PromptTokens:     anthropicResp.Usage.InputTokens,
+			CompletionTokens: anthropicResp.Usage.OutputTokens,
+			TotalTokens:      anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens,
+		},
+	}
+}
+
+func mapAnthropicStopReason(reason string) string {
+	switch reason {
+	case "end_turn":
+		return "stop"
+	case "tool_use":
+		return "tool_calls"
+	case "max_tokens":
+		return "length"
+	default:
+		return "stop"
+	}
+}
+
 // OpenAIToAnthropic 将 OpenAI 响应转换为 Anthropic 响应格式。
 func OpenAIToAnthropic(openAIResp *models.OpenAIChatCompletionResponse) *models.AnthropicMessageResponse {
 	content := make([]models.AnthropicContent, 0)
@@ -268,16 +351,6 @@ func OpenAIStreamChunkToAnthropic(chunk *models.OpenAIStreamChunk) []models.Anth
 	result := make([]models.AnthropicStreamChunk, 0, len(chunk.Choices))
 
 	for _, choice := range chunk.Choices {
-		if choice.Delta.Content != "" {
-			result = append(result, models.AnthropicStreamChunk{
-				Type:  "content_block_delta",
-				Index: choice.Index,
-				Delta: &models.AnthropicStreamDelta{
-					Type: "text_delta",
-					Text: choice.Delta.Content,
-				},
-			})
-		}
 		if choice.Delta.ReasoningContent != "" {
 			result = append(result, models.AnthropicStreamChunk{
 				Type:  "content_block_delta",
@@ -285,6 +358,16 @@ func OpenAIStreamChunkToAnthropic(chunk *models.OpenAIStreamChunk) []models.Anth
 				Delta: &models.AnthropicStreamDelta{
 					Type:     "thinking_delta",
 					Thinking: choice.Delta.ReasoningContent,
+				},
+			})
+		}
+		if choice.Delta.Content != "" {
+			result = append(result, models.AnthropicStreamChunk{
+				Type:  "content_block_delta",
+				Index: choice.Index,
+				Delta: &models.AnthropicStreamDelta{
+					Type: "text_delta",
+					Text: choice.Delta.Content,
 				},
 			})
 		}
@@ -370,12 +453,13 @@ func ExtractSystemMessage(messages []models.OpenAIMessage) (string, []models.Ope
 func OpenAIToAnthropicRequest(req *models.OpenAIChatCompletionRequest) *models.AnthropicMessageRequest {
 	system, filtered := ExtractSystemMessage(req.Messages)
 
-	anthropicMessages := make([]models.AnthropicMessage, len(filtered))
-	for i, m := range filtered {
-		anthropicMessages[i] = models.AnthropicMessage{
-			Role:    m.Role,
-			Content: m.Content,
+	anthropicMessages := make([]models.AnthropicMessage, 0, len(filtered))
+	for _, m := range filtered {
+		msg := openAIMessageToAnthropic(m)
+		if msg.Role == "" {
+			continue
 		}
+		anthropicMessages = append(anthropicMessages, msg)
 	}
 
 	return &models.AnthropicMessageRequest{
@@ -388,6 +472,184 @@ func OpenAIToAnthropicRequest(req *models.OpenAIChatCompletionRequest) *models.A
 		Tools:       openAIToolsToAnthropic(req.Tools),
 		ToolChoice:  req.ToolChoice,
 	}
+}
+
+func openAIMessageToAnthropic(m models.OpenAIMessage) models.AnthropicMessage {
+	switch m.Role {
+	case "user":
+		return models.AnthropicMessage{Role: "user", Content: openAIUserContentToAnthropic(m)}
+	case "assistant":
+		return models.AnthropicMessage{Role: "assistant", Content: openAIAssistantContentToAnthropic(m)}
+	case "tool":
+		return openAIToolResultToAnthropic(m)
+	default:
+		return models.AnthropicMessage{Role: m.Role, Content: m.Content}
+	}
+}
+
+func openAIUserContentToAnthropic(m models.OpenAIMessage) interface{} {
+	if len(m.RawContent) > 0 {
+		parts, err := parseOpenAIContentParts(m.RawContent)
+		if err == nil {
+			blocks := make([]interface{}, 0, len(parts))
+			for _, part := range parts {
+				block := openAIContentPartToAnthropic(part)
+				if block != nil {
+					blocks = append(blocks, block)
+				}
+			}
+			if len(blocks) > 0 {
+				return blocks
+			}
+		}
+	}
+	if m.Content != "" {
+		return m.Content
+	}
+	return ""
+}
+
+func openAIAssistantContentToAnthropic(m models.OpenAIMessage) interface{} {
+	blocks := make([]interface{}, 0)
+
+	if m.ReasoningContent != "" {
+		blocks = append(blocks, map[string]interface{}{
+			"type":     "thinking",
+			"thinking": m.ReasoningContent,
+		})
+	}
+
+	for _, tc := range m.ToolCalls {
+		input := parseToolArguments(tc.Function.Arguments)
+		callID := tc.ID
+		if callID == "" {
+			callID = "toolu_" + randomID()
+		}
+		blocks = append(blocks, map[string]interface{}{
+			"type":  "tool_use",
+			"id":    callID,
+			"name":  tc.Function.Name,
+			"input": input,
+		})
+	}
+
+	if m.Content != "" {
+		blocks = append(blocks, map[string]interface{}{
+			"type": "text",
+			"text": m.Content,
+		})
+	}
+
+	if len(blocks) == 0 {
+		return ""
+	}
+	if len(blocks) == 1 {
+		if textBlock, ok := blocks[0].(map[string]interface{}); ok && textBlock["type"] == "text" {
+			return textBlock["text"]
+		}
+	}
+	return blocks
+}
+
+func openAIToolResultToAnthropic(m models.OpenAIMessage) models.AnthropicMessage {
+	content := m.Content
+	if content == "" {
+		content = "{}"
+	}
+	return models.AnthropicMessage{
+		Role: "user",
+		Content: []interface{}{
+			map[string]interface{}{
+				"type":        "tool_result",
+				"tool_use_id": m.ToolCallID,
+				"content":     content,
+			},
+		},
+	}
+}
+
+func parseOpenAIContentParts(raw []byte) ([]map[string]interface{}, error) {
+	var parts []map[string]interface{}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+func openAIContentPartToAnthropic(part map[string]interface{}) interface{} {
+	partType, _ := part["type"].(string)
+	switch partType {
+	case "text", "input_text":
+		text, _ := part["text"].(string)
+		if text != "" {
+			return map[string]interface{}{
+				"type": "text",
+				"text": text,
+			}
+		}
+	case "image_url":
+		if imageURL, ok := part["image_url"].(map[string]interface{}); ok {
+			url, _ := imageURL["url"].(string)
+			if url != "" {
+				return map[string]interface{}{
+					"type": "image",
+					"source": map[string]interface{}{
+						"type":      "url",
+						"url":       url,
+						"media_type": inferMediaTypeFromURL(url),
+					},
+				}
+			}
+		}
+	case "input_image":
+		if dataURL, _ := part["data"].(string); dataURL != "" {
+			mediaType, data := splitDataURL(dataURL)
+			if data != "" {
+				return map[string]interface{}{
+					"type": "image",
+					"source": map[string]interface{}{
+						"type":       "base64",
+						"media_type": mediaType,
+						"data":       data,
+					},
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func inferMediaTypeFromURL(url string) string {
+	url = strings.ToLower(url)
+	switch {
+	case strings.HasSuffix(url, ".png"):
+		return "image/png"
+	case strings.HasSuffix(url, ".jpg"), strings.HasSuffix(url, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(url, ".gif"):
+		return "image/gif"
+	case strings.HasSuffix(url, ".webp"):
+		return "image/webp"
+	default:
+		return "image/jpeg"
+	}
+}
+
+func splitDataURL(dataURL string) (string, string) {
+	const prefix = "data:"
+	if !strings.HasPrefix(dataURL, prefix) {
+		return "image/jpeg", ""
+	}
+	after := strings.TrimPrefix(dataURL, prefix)
+	idx := strings.Index(after, ";base64,")
+	if idx < 0 {
+		return "image/jpeg", ""
+	}
+	mediaType := after[:idx]
+	if mediaType == "" {
+		mediaType = "image/jpeg"
+	}
+	return mediaType, after[idx+len(";base64,"):]
 }
 
 func openAIToolsToAnthropic(tools []models.OpenAITool) []models.AnthropicTool {

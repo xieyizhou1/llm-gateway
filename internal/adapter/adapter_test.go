@@ -287,6 +287,128 @@ func TestOpenAIToAnthropicRepairsMalformedToolArguments(t *testing.T) {
 	}
 }
 
+func TestOpenAIToAnthropicWithReasoning(t *testing.T) {
+	openAIResp := &models.OpenAIChatCompletionResponse{
+		ID:     "chatcmpl-reasoning",
+		Object: "chat.completion",
+		Model:  "claude-opus",
+		Choices: []models.OpenAIChoice{
+			{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:             "assistant",
+					Content:          "",
+					ReasoningContent: "Let me think... 6 times 7 equals 42.",
+				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: models.OpenAIUsage{
+			PromptTokens:     5,
+			CompletionTokens: 15,
+		},
+	}
+
+	anthropicResp := OpenAIToAnthropic(openAIResp)
+	if len(anthropicResp.Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(anthropicResp.Content))
+	}
+	if anthropicResp.Content[0].Type != "thinking" {
+		t.Fatalf("expected thinking block, got %s", anthropicResp.Content[0].Type)
+	}
+	if anthropicResp.Content[0].Thinking != "Let me think... 6 times 7 equals 42." {
+		t.Fatalf("unexpected thinking content: %s", anthropicResp.Content[0].Thinking)
+	}
+	if anthropicResp.Content[1].Type != "text" {
+		t.Fatalf("expected text block, got %s", anthropicResp.Content[1].Type)
+	}
+	if anthropicResp.Content[1].Text != "Let me think... 6 times 7 equals 42." {
+		t.Fatalf("expected text block to mirror reasoning when content empty, got %s", anthropicResp.Content[1].Text)
+	}
+}
+
+func TestOpenAIToAnthropicMultiBlock(t *testing.T) {
+	openAIResp := &models.OpenAIChatCompletionResponse{
+		ID:     "chatcmpl-multi",
+		Object: "chat.completion",
+		Model:  "claude-opus",
+		Choices: []models.OpenAIChoice{
+			{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:             "assistant",
+					Content:          "The answer is 42.",
+					ReasoningContent: "Multiplying 6 and 7.",
+					ToolCalls: []models.ToolCall{
+						{
+							ID:   "call_789",
+							Type: "function",
+							Function: models.FunctionCall{
+								Name:      "calculator",
+								Arguments: `{"a":6,"b":7}`,
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}
+
+	anthropicResp := OpenAIToAnthropic(openAIResp)
+	if anthropicResp.StopReason != "tool_use" {
+		t.Fatalf("expected stop_reason tool_use, got %s", anthropicResp.StopReason)
+	}
+	if len(anthropicResp.Content) != 3 {
+		t.Fatalf("expected 3 content blocks, got %d", len(anthropicResp.Content))
+	}
+	if anthropicResp.Content[0].Type != "thinking" {
+		t.Fatalf("expected first block thinking, got %s", anthropicResp.Content[0].Type)
+	}
+	if anthropicResp.Content[1].Type != "text" {
+		t.Fatalf("expected second block text, got %s", anthropicResp.Content[1].Type)
+	}
+	if anthropicResp.Content[2].Type != "tool_use" {
+		t.Fatalf("expected third block tool_use, got %s", anthropicResp.Content[2].Type)
+	}
+	if anthropicResp.Content[2].Name != "calculator" {
+		t.Fatalf("expected calculator tool, got %s", anthropicResp.Content[2].Name)
+	}
+	input, ok := anthropicResp.Content[2].Input.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected input object, got %T", anthropicResp.Content[2].Input)
+	}
+	if input["a"] != float64(6) || input["b"] != float64(7) {
+		t.Fatalf("unexpected input: %+v", input)
+	}
+}
+
+func TestOpenAIToAnthropicEmptyReasoningBecomesText(t *testing.T) {
+	openAIResp := &models.OpenAIChatCompletionResponse{
+		ID:     "chatcmpl-text",
+		Object: "chat.completion",
+		Model:  "claude-opus",
+		Choices: []models.OpenAIChoice{
+			{
+				Index: 0,
+				Message: models.OpenAIMessage{
+					Role:    "assistant",
+					Content: "Hello!",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+
+	anthropicResp := OpenAIToAnthropic(openAIResp)
+	if len(anthropicResp.Content) != 1 {
+		t.Fatalf("expected 1 content block, got %d", len(anthropicResp.Content))
+	}
+	if anthropicResp.Content[0].Type != "text" || anthropicResp.Content[0].Text != "Hello!" {
+		t.Fatalf("unexpected content: %+v", anthropicResp.Content[0])
+	}
+}
+
 func TestMapModel(t *testing.T) {
 	modelMap := map[string]string{
 		"gpt-4":         "moonshot-v1-8k",
@@ -350,6 +472,189 @@ func TestOpenAIToAnthropicRequest(t *testing.T) {
 	}
 	if anthropicReq.Messages[0].Role != "user" {
 		t.Errorf("expected role user, got %s", anthropicReq.Messages[0].Role)
+	}
+}
+
+func TestOpenAIToAnthropicRequestUserImage(t *testing.T) {
+	openAIReq := &models.OpenAIChatCompletionRequest{
+		Model: "gpt-4o",
+		Messages: []models.OpenAIMessage{
+			{Role: "user", RawContent: []byte(`[
+				{"type":"text","text":"What is in this image?"},
+				{"type":"image_url","image_url":{"url":"https://example.com/img.png","detail":"high"}}
+			]`)},
+		},
+		MaxTokens: 100,
+	}
+
+	anthropicReq := OpenAIToAnthropicRequest(openAIReq)
+	if len(anthropicReq.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(anthropicReq.Messages))
+	}
+	if anthropicReq.Messages[0].Role != "user" {
+		t.Fatalf("expected role user, got %s", anthropicReq.Messages[0].Role)
+	}
+	content, ok := anthropicReq.Messages[0].Content.([]interface{})
+	if !ok {
+		t.Fatalf("expected content array, got %T", anthropicReq.Messages[0].Content)
+	}
+	if len(content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(content))
+	}
+	textBlock := content[0].(map[string]interface{})
+	if textBlock["type"] != "text" || textBlock["text"] != "What is in this image?" {
+		t.Fatalf("unexpected text block: %+v", textBlock)
+	}
+	imageBlock := content[1].(map[string]interface{})
+	if imageBlock["type"] != "image" {
+		t.Fatalf("expected image block, got %s", imageBlock["type"])
+	}
+	source := imageBlock["source"].(map[string]interface{})
+	if source["type"] != "url" || source["url"] != "https://example.com/img.png" {
+		t.Fatalf("unexpected image source: %+v", source)
+	}
+}
+
+func TestOpenAIToAnthropicRequestAssistantToolCalls(t *testing.T) {
+	openAIReq := &models.OpenAIChatCompletionRequest{
+		Model: "gpt-4o",
+		Messages: []models.OpenAIMessage{
+			{Role: "user", Content: "List files"},
+			{
+				Role:      "assistant",
+				Content:   "",
+				ToolCalls: []models.ToolCall{
+					{
+						ID:   "call_123",
+						Type: "function",
+						Function: models.FunctionCall{
+							Name:      "shell_command",
+							Arguments: `{"command":"ls"}`,
+						},
+					},
+				},
+			},
+			{Role: "tool", Content: "main.go adapter.go", ToolCallID: "call_123"},
+		},
+	}
+
+	anthropicReq := OpenAIToAnthropicRequest(openAIReq)
+	if len(anthropicReq.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(anthropicReq.Messages))
+	}
+	// assistant tool_use
+	assistant := anthropicReq.Messages[1]
+	if assistant.Role != "assistant" {
+		t.Fatalf("expected assistant role, got %s", assistant.Role)
+	}
+	blocks, ok := assistant.Content.([]interface{})
+	if !ok {
+		t.Fatalf("expected assistant content array, got %T", assistant.Content)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 assistant block, got %d", len(blocks))
+	}
+	tu, ok := blocks[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map block, got %T", blocks[0])
+	}
+	if tu["type"] != "tool_use" || tu["id"] != "call_123" || tu["name"] != "shell_command" {
+		t.Fatalf("unexpected tool_use block: %+v", tu)
+	}
+	input, ok := tu["input"].(map[string]interface{})
+	if !ok || input["command"] != "ls" {
+		t.Fatalf("unexpected tool input: %+v", tu["input"])
+	}
+
+	// tool result
+	tr := anthropicReq.Messages[2]
+	if tr.Role != "user" {
+		t.Fatalf("expected tool result mapped to user, got %s", tr.Role)
+	}
+	trBlocks, ok := tr.Content.([]interface{})
+	if !ok || len(trBlocks) != 1 {
+		t.Fatalf("expected 1 tool_result block, got %+v", tr.Content)
+	}
+	trBlock := trBlocks[0].(map[string]interface{})
+	if trBlock["type"] != "tool_result" || trBlock["tool_use_id"] != "call_123" {
+		t.Fatalf("unexpected tool_result block: %+v", trBlock)
+	}
+	if trBlock["content"] != "main.go adapter.go" {
+		t.Fatalf("unexpected tool_result content: %v", trBlock["content"])
+	}
+}
+
+func TestOpenAIToAnthropicRequestReasoningContent(t *testing.T) {
+	openAIReq := &models.OpenAIChatCompletionRequest{
+		Model: "claude-opus",
+		Messages: []models.OpenAIMessage{
+			{Role: "user", Content: "Think step by step"},
+			{
+				Role:             "assistant",
+				Content:          "The answer is 42.",
+				ReasoningContent: "Let me compute... 6 times 7 is 42.",
+			},
+		},
+	}
+
+	anthropicReq := OpenAIToAnthropicRequest(openAIReq)
+	if len(anthropicReq.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(anthropicReq.Messages))
+	}
+	content, ok := anthropicReq.Messages[1].Content.([]interface{})
+	if !ok {
+		t.Fatalf("expected content array, got %T", anthropicReq.Messages[1].Content)
+	}
+	if len(content) != 2 {
+		t.Fatalf("expected 2 content blocks (thinking + text), got %d", len(content))
+	}
+	thinking := content[0].(map[string]interface{})
+	if thinking["type"] != "thinking" || thinking["thinking"] != "Let me compute... 6 times 7 is 42." {
+		t.Fatalf("unexpected thinking block: %+v", thinking)
+	}
+	text := content[1].(map[string]interface{})
+	if text["type"] != "text" || text["text"] != "The answer is 42." {
+		t.Fatalf("unexpected text block: %+v", text)
+	}
+}
+
+func TestOpenAIToAnthropicRequestOpenAITools(t *testing.T) {
+	openAIReq := &models.OpenAIChatCompletionRequest{
+		Model: "gpt-4o",
+		Tools: []models.OpenAITool{
+			{
+				Type: "function",
+				Function: models.OpenAIFunction{
+					Name:        "shell_command",
+					Description: "Run a shell command",
+					Parameters: map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"command": map[string]interface{}{"type": "string"},
+						},
+						"required": []string{"command"},
+					},
+				},
+			},
+		},
+		ToolChoice: map[string]interface{}{"type": "tool", "name": "shell_command"},
+	}
+
+	anthropicReq := OpenAIToAnthropicRequest(openAIReq)
+	if len(anthropicReq.Tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(anthropicReq.Tools))
+	}
+	if anthropicReq.Tools[0].Name != "shell_command" {
+		t.Fatalf("expected tool name shell_command, got %s", anthropicReq.Tools[0].Name)
+	}
+	if anthropicReq.Tools[0].Description != "Run a shell command" {
+		t.Fatalf("expected tool description, got %s", anthropicReq.Tools[0].Description)
+	}
+	if len(anthropicReq.Tools[0].InputSchema) == 0 {
+		t.Fatal("expected input_schema to be set")
+	}
+	if anthropicReq.ToolChoice == nil {
+		t.Fatal("expected tool_choice to be preserved")
 	}
 }
 
@@ -431,6 +736,97 @@ func TestOpenAIStreamChunkToAnthropicToolCallsAndReasoning(t *testing.T) {
 	}
 	if result[2].Type != "message_stop" {
 		t.Fatalf("expected message_stop, got %s", result[2].Type)
+	}
+}
+
+func TestOpenAIStreamChunkToAnthropicEmptyContent(t *testing.T) {
+	finishReason := "stop"
+	chunk := &models.OpenAIStreamChunk{
+		ID:      "chatcmpl-empty",
+		Object:  "chat.completion.chunk",
+		Created: 1234567891,
+		Model:   "moonshot-v1-8k",
+		Choices: []models.OpenAIStreamChoice{
+			{
+				Index: 0,
+				Delta: models.OpenAIMessage{
+					Role: "assistant",
+				},
+				FinishReason: &finishReason,
+			},
+		},
+	}
+
+	result := OpenAIStreamChunkToAnthropic(chunk)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 chunk (message_stop only), got %d", len(result))
+	}
+	if result[0].Type != "message_stop" {
+		t.Fatalf("expected message_stop, got %s", result[0].Type)
+	}
+}
+
+func TestOpenAIStreamChunkToAnthropicMultipleToolCallDeltas(t *testing.T) {
+	chunk := &models.OpenAIStreamChunk{
+		ID:      "chatcmpl-tool-deltas",
+		Object:  "chat.completion.chunk",
+		Created: 1234567891,
+		Model:   "moonshot-v1-8k",
+		Choices: []models.OpenAIStreamChoice{
+			{
+				Index: 0,
+				Delta: models.OpenAIMessage{
+					ToolCalls: []models.ToolCall{
+						{Index: 0, Function: models.FunctionCall{Arguments: `{"c`}},
+						{Index: 0, Function: models.FunctionCall{Arguments: `ommand`}},
+						{Index: 0, Function: models.FunctionCall{Arguments: `":"ls"}`}},
+					},
+				},
+			},
+		},
+	}
+
+	result := OpenAIStreamChunkToAnthropic(chunk)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 input_json_delta chunks, got %d", len(result))
+	}
+	for i, r := range result {
+		if r.Type != "content_block_delta" || r.Delta == nil || r.Delta.Type != "input_json_delta" {
+			t.Fatalf("chunk %d expected input_json_delta, got %+v", i, r)
+		}
+	}
+	concat := result[0].Delta.PartialJSON + result[1].Delta.PartialJSON + result[2].Delta.PartialJSON
+	if concat != `{"command":"ls"}` {
+		t.Fatalf("unexpected concatenated arguments: %s", concat)
+	}
+}
+
+func TestOpenAIStreamChunkToAnthropicReasoningAndText(t *testing.T) {
+	chunk := &models.OpenAIStreamChunk{
+		ID:      "chatcmpl-reason-stream",
+		Object:  "chat.completion.chunk",
+		Created: 1234567891,
+		Model:   "moonshot-v1-8k",
+		Choices: []models.OpenAIStreamChoice{
+			{
+				Index: 0,
+				Delta: models.OpenAIMessage{
+					ReasoningContent: "hidden reasoning",
+					Content:          " visible answer",
+				},
+			},
+		},
+	}
+
+	result := OpenAIStreamChunkToAnthropic(chunk)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(result))
+	}
+	if result[0].Delta == nil || result[0].Delta.Type != "thinking_delta" || result[0].Delta.Thinking != "hidden reasoning" {
+		t.Fatalf("expected thinking_delta, got %+v", result[0])
+	}
+	if result[1].Delta == nil || result[1].Delta.Type != "text_delta" || result[1].Delta.Text != " visible answer" {
+		t.Fatalf("expected text_delta, got %+v", result[1])
 	}
 }
 
@@ -1501,5 +1897,59 @@ func TestRewriteOpenAIStreamBodyWithReasoningPreservesRealReasoning(t *testing.T
 	}
 	if strings.Contains(got, reasoningPlaceholder) {
 		t.Fatalf("expected placeholder not to replace real reasoning, got:\n%s", got)
+	}
+}
+
+func TestAnthropicToOpenAIResponse(t *testing.T) {
+	anthropicResp := &models.AnthropicMessageResponse{
+		ID:         "msg_123",
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "claude-sonnet",
+		StopReason: "end_turn",
+		Content: []models.AnthropicContent{
+			{Type: "text", Text: "Hello!"},
+		},
+		Usage: models.AnthropicUsage{
+			InputTokens:  10,
+			OutputTokens: 5,
+		},
+	}
+
+	openAIResp := AnthropicToOpenAIResponse(anthropicResp)
+
+	if openAIResp.ID != "msg_123" {
+		t.Errorf("expected id msg_123, got %s", openAIResp.ID)
+	}
+	if openAIResp.Object != "chat.completion" {
+		t.Errorf("expected object chat.completion, got %s", openAIResp.Object)
+	}
+	if openAIResp.Model != "claude-sonnet" {
+		t.Errorf("expected model claude-sonnet, got %s", openAIResp.Model)
+	}
+	if len(openAIResp.Choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d", len(openAIResp.Choices))
+	}
+	choice := openAIResp.Choices[0]
+	if choice.Index != 0 {
+		t.Errorf("expected index 0, got %d", choice.Index)
+	}
+	if choice.Message.Role != "assistant" {
+		t.Errorf("expected role assistant, got %s", choice.Message.Role)
+	}
+	if choice.Message.Content != "Hello!" {
+		t.Errorf("expected content Hello!, got %s", choice.Message.Content)
+	}
+	if choice.FinishReason != "stop" {
+		t.Errorf("expected finish_reason stop, got %s", choice.FinishReason)
+	}
+	if openAIResp.Usage.PromptTokens != 10 {
+		t.Errorf("expected prompt_tokens 10, got %d", openAIResp.Usage.PromptTokens)
+	}
+	if openAIResp.Usage.CompletionTokens != 5 {
+		t.Errorf("expected completion_tokens 5, got %d", openAIResp.Usage.CompletionTokens)
+	}
+	if openAIResp.Usage.TotalTokens != 15 {
+		t.Errorf("expected total_tokens 15, got %d", openAIResp.Usage.TotalTokens)
 	}
 }

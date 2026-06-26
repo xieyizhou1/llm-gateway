@@ -784,6 +784,214 @@ func TestKeyPoolMarkSuccessRecoversCooldown(t *testing.T) {
 	}
 }
 
+func TestRouterAllKeyStatuses(t *testing.T) {
+	cfg := &config.Config{
+		Providers: config.ProvidersConfig{
+			Kimi: config.ProviderConfig{
+				BaseURL: "https://api.kimi.com",
+				Keys: []config.ProviderKey{
+					{ID: "k1", Key: "sk-k1", Weight: 1, RPMLimit: 60},
+				},
+			},
+		},
+		Router: config.RouterConfig{
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
+		},
+		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
+		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
+	}
+
+	r := NewRouter(cfg, nil)
+	statuses := r.AllKeyStatuses()
+	if len(statuses) != 1 {
+		t.Fatalf("expected 1 key status, got %d", len(statuses))
+	}
+	if statuses[0].Provider != "kimi" || statuses[0].ID != "k1" {
+		t.Fatalf("unexpected status: %+v", statuses[0])
+	}
+	if statuses[0].State != "healthy" {
+		t.Fatalf("expected healthy state, got %s", statuses[0].State)
+	}
+}
+
+func TestRouterSetKeyState(t *testing.T) {
+	cfg := &config.Config{
+		Providers: config.ProvidersConfig{
+			Kimi: config.ProviderConfig{
+				BaseURL: "https://api.kimi.com",
+				Keys: []config.ProviderKey{
+					{ID: "k1", Key: "sk-k1", Weight: 1, RPMLimit: 60},
+				},
+			},
+		},
+		Router: config.RouterConfig{
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
+		},
+		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
+		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
+	}
+
+	r := NewRouter(cfg, nil)
+	if !r.SetKeyState("kimi", "k1", "disable") {
+		t.Fatal("expected SetKeyState to succeed")
+	}
+	_, err := r.Route(context.Background(), "gpt-4")
+	if err == nil {
+		t.Fatal("expected route to fail after disabling only key")
+	}
+
+	if !r.SetKeyState("kimi", "k1", "enable") {
+		t.Fatal("expected SetKeyState enable to succeed")
+	}
+	route, err := r.Route(context.Background(), "gpt-4")
+	if err != nil {
+		t.Fatalf("expected route to succeed after enabling key: %v", err)
+	}
+	if route.Key.ID != "k1" {
+		t.Fatalf("expected key k1, got %s", route.Key.ID)
+	}
+}
+
+func TestRouterSetKeyStateInvalidAction(t *testing.T) {
+	cfg := &config.Config{
+		Providers: config.ProvidersConfig{
+			Kimi: config.ProviderConfig{
+				BaseURL: "https://api.kimi.com",
+				Keys: []config.ProviderKey{
+					{ID: "k1", Key: "sk-k1", Weight: 1, RPMLimit: 60},
+				},
+			},
+		},
+		Router: config.RouterConfig{
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
+		},
+		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
+		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
+	}
+
+	r := NewRouter(cfg, nil)
+	if r.SetKeyState("kimi", "k1", "invalid") {
+		t.Fatal("expected invalid action to return false")
+	}
+}
+
+func TestRouterSetKeyStateUnknownProvider(t *testing.T) {
+	cfg := &config.Config{
+		Providers: config.ProvidersConfig{
+			Kimi: config.ProviderConfig{
+				BaseURL: "https://api.kimi.com",
+				Keys: []config.ProviderKey{
+					{ID: "k1", Key: "sk-k1", Weight: 1, RPMLimit: 60},
+				},
+			},
+		},
+		Router: config.RouterConfig{
+			Strategy:        "round_robin",
+			RetryCount:      2,
+			TimeoutSeconds:  30,
+			CooldownSeconds: 60,
+		},
+		Redis:   config.RedisConfig{Host: "localhost", Port: 6379, DB: 0},
+		Logging: config.LoggingConfig{Level: "INFO", Format: "json"},
+	}
+
+	r := NewRouter(cfg, nil)
+	if r.SetKeyState("unknown", "k1", "disable") {
+		t.Fatal("expected unknown provider to return false")
+	}
+}
+
+func TestRouteWithOptionsFallsBackWhenNoImageProvider(t *testing.T) {
+	cfg := &config.Config{
+		Providers: config.ProvidersConfig{
+			Kimi: config.ProviderConfig{
+				BaseURL: "https://kimi.test/v1",
+				Keys: []config.ProviderKey{
+					{ID: "kimi-1", Key: "kimi-key", RPMLimit: 60},
+				},
+				ModelMap:       map[string]string{"vision-model": "vision-model"},
+				SupportsImages: true,
+			},
+			DeepSeek: config.ProviderConfig{
+				BaseURL: "https://deepseek.test/v1",
+				Keys: []config.ProviderKey{
+					{ID: "deepseek-1", Key: "deepseek-key", RPMLimit: 60},
+				},
+				ModelMap: map[string]string{"vision-model": "vision-model"},
+			},
+		},
+		Router: config.RouterConfig{
+			ProviderOrder: []string{"deepseek", "kimi"},
+		},
+		ModelCapabilities: map[string]config.ModelCapability{
+			"vision-model": {SupportsImages: true},
+		},
+	}
+
+	r := NewRouter(cfg, nil)
+	// Disable kimi so only deepseek remains, but deepseek does not support images.
+	r.SetKeyState("kimi", "kimi-1", "disable")
+
+	_, err := r.RouteWithOptions(context.Background(), "vision-model", RouteOptions{RequireImages: true})
+	if err == nil {
+		t.Fatal("expected no image-capable provider available")
+	}
+}
+
+func TestKeyPoolMarkHeartbeat(t *testing.T) {
+	cfg := config.ProviderConfig{
+		BaseURL: "https://api.test.com",
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "test-key-1", Weight: 1, RPMLimit: 60},
+		},
+	}
+
+	pool := NewKeyPool("test", cfg)
+	pool.MarkHeartbeat("key-1", true)
+	if pool.keys[0].LastSeenAt.IsZero() {
+		t.Error("expected LastSeenAt to be set after heartbeat ok")
+	}
+
+	pool.MarkHeartbeat("key-1", false)
+	pool.MarkHeartbeat("key-1", false)
+	pool.MarkHeartbeat("key-1", false)
+
+	_, err := pool.Next()
+	if err == nil {
+		t.Error("expected key to be in cooldown after 3 failed heartbeats")
+	}
+}
+
+func TestKeyPoolMarkHealthy(t *testing.T) {
+	cfg := config.ProviderConfig{
+		BaseURL: "https://api.test.com",
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "test-key-1", Weight: 1, RPMLimit: 60},
+		},
+	}
+
+	pool := NewKeyPool("test", cfg)
+	pool.MarkCooldown("key-1", 5*time.Second)
+	pool.MarkHealthy("key-1")
+
+	key, err := pool.Next()
+	if err != nil {
+		t.Fatalf("expected key to be healthy, got %v", err)
+	}
+	if key.ID != "key-1" {
+		t.Fatalf("expected key-1, got %s", key.ID)
+	}
+}
+
 func TestRouterSetModelMapForTest(t *testing.T) {
 	cfg := &config.Config{
 		Providers: config.ProvidersConfig{
