@@ -491,6 +491,62 @@ func TestForwarder_401DisablesKey(t *testing.T) {
 	}
 }
 
+func TestForwarder_200BodyAuthErrorRetriesAndDisablesKey(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if callCount == 1 {
+			w.Write([]byte(`{"error":{"message":"The API Key appears to be invalid","type":"invalid_authentication_error"}}`))
+			return
+		}
+		w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	pool := router.NewKeyPool("kimi", config.ProviderConfig{
+		BaseURL: upstream.URL,
+		Keys: []config.ProviderKey{
+			{ID: "key-1", Key: "sk-bad", Weight: 1, RPMLimit: 60},
+			{ID: "key-2", Key: "sk-good", Weight: 1, RPMLimit: 60},
+		},
+	})
+	r := &router.Router{}
+	r.SetPoolForTest("kimi", pool)
+	r.DisableRateLimitForTest()
+	r.SetModelMapForTest("kimi", config.ProviderConfig{
+		BaseURL:  upstream.URL,
+		ModelMap: map[string]string{"gpt-4o": "deepseek-chat"},
+	})
+
+	fwd := NewForwarder(r, 10*time.Second, 1)
+	defer fwd.Close()
+
+	req := &models.OpenAIChatCompletionRequest{
+		Model:    "gpt-4o",
+		Messages: []models.OpenAIMessage{{Role: "user", Content: "Hi"}},
+	}
+
+	resp, err := fwd.ForwardOpenAIRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("expected successful response after retry, got error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 response, got %d", resp.StatusCode)
+	}
+
+	if pool.HealthyCount() != 1 {
+		t.Errorf("expected 1 healthy key remaining, got %d", pool.HealthyCount())
+	}
+
+	if callCount != 2 {
+		t.Errorf("expected 2 upstream calls, got %d", callCount)
+	}
+}
+
 func TestForwarder_HeartbeatMarksKeyResult(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {

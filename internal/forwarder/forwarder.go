@@ -356,16 +356,24 @@ func (f *Forwarder) forwardWithRetry(ctx context.Context, req *models.OpenAIChat
 			continue
 		}
 
-		// 更新 Key 健康状态
-		f.router.MarkKeyResult(route.Provider, route.Key.ID, resp.StatusCode)
+		// 某些 Provider（如 Kimi）会在 HTTP 200 响应体里返回 JSON 错误，
+		// 需要 peek 出来按真实错误码处理，才能正确重试并禁用失效 key。
+		effectiveStatus, errBody := effectiveStatusFromResponse(resp)
 
-		if shouldRetryUpstreamStatus(resp.StatusCode) {
+		// 更新 Key 健康状态（使用识别后的真实状态码）
+		f.router.MarkKeyResult(route.Provider, route.Key.ID, effectiveStatus)
+
+		if shouldRetryUpstreamStatus(effectiveStatus) {
 			if retryableResp != nil && retryableResp != resp {
 				_ = retryableResp.Body.Close()
 			}
 			retryableResp = resp
 			retryableInfo = info
-			lastErr = fmt.Errorf("provider %s returned %d", route.Provider, resp.StatusCode)
+			if len(errBody) > 0 {
+				lastErr = fmt.Errorf("provider %s returned %d (body: %s)", route.Provider, effectiveStatus, truncateForLog(string(errBody), 512))
+			} else {
+				lastErr = fmt.Errorf("provider %s returned %d", route.Provider, effectiveStatus)
+			}
 			continue
 		}
 
@@ -526,6 +534,76 @@ func (f *Forwarder) forwardRawWithRetry(ctx context.Context, body []byte, model 
 
 func shouldRetryUpstreamStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+}
+
+// effectiveStatusFromResponse peeks at a response body that some providers return
+// with HTTP 200 but contains a JSON error envelope. It restores the body so the
+// response can still be read downstream, and returns the effective HTTP status
+// code that should be used for retries and key health tracking.
+func effectiveStatusFromResponse(resp *http.Response) (int, []byte) {
+	if resp == nil || resp.Body == nil {
+		return http.StatusServiceUnavailable, nil
+	}
+
+	// Only 2xx/3xx bodies may hide JSON errors; real 4xx/5xx keep their status.
+	if resp.StatusCode >= http.StatusBadRequest {
+		return resp.StatusCode, nil
+	}
+
+	buf := make([]byte, 4096)
+	n, err := resp.Body.Read(buf)
+	var readErr error
+	var rest bytes.Buffer
+	if n > 0 {
+		rest.Write(buf[:n])
+		if err == nil {
+			_, readErr = io.Copy(&rest, resp.Body)
+		}
+	} else if err != nil && err != io.EOF {
+		readErr = err
+	}
+
+	body := rest.Bytes()
+	trimmed := strings.TrimSpace(string(body))
+	if !strings.HasPrefix(trimmed, "{\"error\"") && !strings.HasPrefix(trimmed, "{\"type\"") {
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), resp.Body))
+		if readErr != nil {
+			return http.StatusServiceUnavailable, body
+		}
+		return resp.StatusCode, nil
+	}
+
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(body, &env)
+
+	errType := strings.ToLower(env.Error.Type)
+	if errType == "" {
+		errType = strings.ToLower(env.Type)
+	}
+	msg := strings.ToLower(env.Error.Message)
+
+	switch {
+	case errType == "invalid_authentication_error" || strings.Contains(msg, "api key") && strings.Contains(msg, "invalid"):
+		resp.StatusCode = http.StatusUnauthorized
+	case errType == "rate_limit_error" || strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests"):
+		resp.StatusCode = http.StatusTooManyRequests
+	case errType == "invalid_request_error" || strings.Contains(msg, "bad request"):
+		resp.StatusCode = http.StatusBadRequest
+	case errType == "not_found_error" || strings.Contains(msg, "not found"):
+		resp.StatusCode = http.StatusNotFound
+	default:
+		// Unknown JSON error in a 200 body: treat as retryable upstream error.
+		resp.StatusCode = http.StatusServiceUnavailable
+	}
+
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp.StatusCode, body
 }
 
 func truncateForLog(s string, max int) string {
