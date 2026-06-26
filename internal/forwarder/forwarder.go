@@ -623,6 +623,7 @@ func (f *Forwarder) doRequest(ctx context.Context, url string, body []byte, apiK
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "llm-gateway/1.0")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	for key, value := range headers {
 		if key != "" && value != "" {
