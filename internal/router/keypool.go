@@ -497,7 +497,7 @@ func (r *Router) MarkKeyResult(provider, keyID string, statusCode int) {
 	switch {
 	case statusCode == http.StatusUnauthorized:
 		pool.MarkDisabled(keyID)
-	case statusCode == http.StatusTooManyRequests:
+	case statusCode == http.StatusTooManyRequests || statusCode == http.StatusPaymentRequired:
 		pool.MarkCooldown(keyID, time.Duration(r.cooldownSeconds)*time.Second)
 	case statusCode == http.StatusServiceUnavailable:
 		pool.MarkHeartbeat(keyID, false)
